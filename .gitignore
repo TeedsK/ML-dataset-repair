@@ -1,0 +1,22 @@
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+!.vscode/*.code-snippets
+
+# local History for Visual Studio Code
+.history/
+
+# VSC Extensions
+*.vsix
+
+# do not add virtual environment
+venv/
+
+__pycache__
+.DS_Store
+
+# notebook outputs
+*.crc
+_SUCCESS

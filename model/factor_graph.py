@@ -1,6 +1,7 @@
 # File: model/factor_graph.py (Refactored)
 # Defines the HoloClean factor graph, learning, and inference logic using pgmpy.
 
+import sys
 import pandas as pd
 import time
 import psycopg2
@@ -12,6 +13,8 @@ from scipy.optimize import minimize
 from collections import defaultdict
 import random
 import itertools # Added for combinations if needed later, not currently used directly here
+
+log_count = 0
 
 class HoloCleanFactorGraph:
     """
@@ -33,8 +36,8 @@ class HoloCleanFactorGraph:
         self.query_vars: list[str] = []
 
         # cfg / constants
-        self.initial_weight_value = 0.01
-        self.l2_penalty = 0.01
+        self.initial_weight_value = 0.1
+        self.l2_penalty = 0.0001
         self.log_potential_clip = 15.0
         self.epsilon = 1e-10
 
@@ -178,6 +181,30 @@ class HoloCleanFactorGraph:
                          else: missing_feature_links += 1
                      else: missing_feature_links += 1
                  else: missing_feature_links += 1
+
+        # --- AFTER the loop populating self.features_data ---
+
+        print("Building state-to-features reverse map...")
+        self.state_to_features_map = defaultdict(list)
+        feature_count_in_map = 0
+        for feature_name, affected_states_list in self.features_data.items():
+            if not isinstance(affected_states_list, list): # Basic check
+                 print(f"Warning: Expected list for feature {feature_name}, got {type(affected_states_list)}. Skipping.")
+                 continue
+            for var_state_tuple in affected_states_list:
+                # Ensure var_state_tuple is indeed a tuple of (var_name, state_int)
+                if isinstance(var_state_tuple, tuple) and len(var_state_tuple) == 2:
+                    self.state_to_features_map[var_state_tuple].append(feature_name)
+                    feature_count_in_map += 1
+                else:
+                    # This case indicates a potential issue upstream in feature generation/loading
+                     print(f"Warning: Invalid item '{var_state_tuple}' in affected states list for feature '{feature_name}'. Expected (var_name, state_int). Skipping.")
+        
+
+        map_build_time = time.time() - start_time # Reset start_time if needed or use a new one
+        print(f"State-to-features map built in {map_build_time:.2f}s. Contains {len(self.state_to_features_map)} state entries and {feature_count_in_map} feature links.")
+        # --- End of new section ---
+
         # (End feature prep)
         build_time = time.time() - start_time
         print(f"Processed {processed_feature_links} feature links. Could not map {missing_feature_links} links.")
@@ -186,18 +213,19 @@ class HoloCleanFactorGraph:
 
 
     def _get_potential_sum(self, var_name, state_int, current_weights):
-        """Calculate sum of (clipped) log potentials for a specific variable state."""
+        """Calculate sum of (clipped) log potentials for a specific variable state using the precomputed map."""
         log_potential_sum = 0.0
-        # Iterate through all features
-        for feature_name, affected_states in self.features_data.items():
-             # Check if this feature affects the var_name and state_int
-             # This check can be slow if features_data is huge.
-             # Pre-calculating a reverse map (var_name, state_int) -> [feature_name] might speed this up.
-             if (var_name, state_int) in affected_states:
-                  weight = current_weights.get(feature_name, 0.0)
-                  # Clip weight to prevent large values before exp() later
-                  clipped_weight = np.clip(weight, -self.log_potential_clip, self.log_potential_clip)
-                  log_potential_sum += clipped_weight
+        var_state_key = (var_name, state_int)
+    
+        # Directly look up the features affecting this state
+        relevant_feature_names = self.state_to_features_map.get(var_state_key, []) # Use .get for safety
+    
+        for feature_name in relevant_feature_names:
+            weight = current_weights.get(feature_name, 0.0) # Get current weight from optimizer
+            # Clip weight to prevent large values before exp() later
+            clipped_weight = np.clip(weight, -self.log_potential_clip, self.log_potential_clip)
+            log_potential_sum += clipped_weight
+    
         return log_potential_sum
 
     # ──────────────────────────────────────────────────────────────────────
@@ -211,6 +239,8 @@ class HoloCleanFactorGraph:
         """
         current_weights = dict(zip(feature_names_list, weights_array))
         pseudo_log_likelihood = 0.0
+        global log_count # Add 'global log_count' at top of file or handle state differently
+        first_var_logged = False # Flag to control detailed logging for the first variable
 
         if not self.evidence_dict: # If no evidence, PLL is 0 (or could be based on priors)
              # Regularization still applies
@@ -227,20 +257,41 @@ class HoloCleanFactorGraph:
             # Calculate potential sums for all possible states of this variable
             log_potential_all_states = []
             num_states = len(self.variable_states[var_name])
+            state_map = self.variable_states[var_name] # Get the state map {idx: value}
+
             if num_states <= 0: continue # Should not happen
 
             for state_int in range(num_states):
                 log_potential_all_states.append(self._get_potential_sum(var_name, state_int, current_weights))
 
-            # Calculate log partition function Z (using log-sum-exp)
             log_potential_all_states = np.array(log_potential_all_states)
             max_log_potential = np.max(log_potential_all_states)
-            # Prevent log(0) by adding epsilon inside log
-            log_Z = max_log_potential + np.log(np.sum(np.exp(log_potential_all_states - max_log_potential)) + self.epsilon)
+            if np.isneginf(max_log_potential): max_log_potential = -700 # Avoid issues with all -inf
+
+            #  Calculate log_Z carefully
+            shifted_potentials = log_potential_all_states - max_log_potential
+            sum_exp_terms = np.sum(np.exp(shifted_potentials))
+            log_Z = max_log_potential + np.log(sum_exp_terms + self.epsilon) # Epsilon avoids log(0)
 
             # Log probability of evidence state: log(exp(pot_evidence) / Z) = pot_evidence - log_Z
             log_prob_evidence = log_potential_evidence_state - log_Z
             pseudo_log_likelihood += log_prob_evidence
+
+
+            # --- ADDED DETAILED DEBUG FOR FIRST VAR ON FIRST CALL ---
+            if log_count == 0 and not first_var_logged:
+                 print(f"\n--- Detailed Likelihood Debug (Var: {var_name}, Evidence State Idx: {evidence_state_idx}, Evidence Val: '{state_map.get(evidence_state_idx, 'N/A')}') ---")
+                 print(f"  Number of States: {num_states}")
+                 # Limit printing potentials if too many states
+                 max_states_to_print = 20
+                 print(f"  Log Potentials (All States): {np.array2string(log_potential_all_states[:max_states_to_print], precision=4)} {'...' if num_states > max_states_to_print else ''}")
+                 print(f"  Log Potential (Evidence State): {log_potential_evidence_state:.6f}")
+                 print(f"  Max Log Potential: {max_log_potential:.6f}")
+                 print(f"  Log Sum Exp Term (sum(exp(shifted))): {sum_exp_terms:.6f}")
+                 print(f"  Log Partition Function (log_Z): {log_Z:.6f}")
+                 print(f"  Log Prob Evidence (Pot_ev - log_Z): {log_prob_evidence:.6f}")
+                 print(f"--- End Detailed Debug ---")
+                 first_var_logged = True # Ensure we on
 
             if not np.isfinite(pseudo_log_likelihood):
                  print(f"WARNING: Non-finite PLL contribution from {var_name}. Potentials: {log_potential_all_states}, log_Z: {log_Z}")
@@ -250,23 +301,31 @@ class HoloCleanFactorGraph:
         # Regularization Penalty (L2)
         l2_norm_sq = np.sum(weights_array**2)
         penalty = 0.5 * self.l2_penalty * l2_norm_sq
+        pll_term = -pseudo_log_likelihood
+        objective_value = pll_term + penalty
 
         # We want to MAXIMIZE PLL, so MINIMIZE negative PLL + penalty
-        objective_value = -pseudo_log_likelihood + penalty
+        # objective_value = -pseudo_log_likelihood + penalty
+
+        
+        if 'log_count' not in globals(): log_count = 0
+        if log_count < 2:
+             print(f"\n[Likelihood-Debug] Iter {log_count}:")
+             print(f"  Neg PLL Term = {pll_term:.6f}")
+             print(f"  L2 Penalty   = {penalty:.6f}")
+             print(f"  Objective    = {objective_value:.6f}")
+             log_count += 1
 
         if not np.isfinite(objective_value):
              print(f"WARNING: Objective function returned non-finite value. PLL={pseudo_log_likelihood}, Penalty={penalty}")
-             return 1e10 * (1 + np.sum(weights_array**2)) # Return large penalty
-
-        # Debug print (optional, can be verbose)
-        # print(f"NegPLL: {objective_value:.4f} (PLL part: {-pseudo_log_likelihood:.4f}, Penalty: {penalty:.4f})")
+             return 1e10 * (1 + np.sum(weights_array**2))
+        
         return objective_value
 
     def fit(self, max_iter=100):
         """Learns the feature weights using evidence via L-BFGS-B."""
         if not self.evidence_dict:
              print("WARNING: No evidence variables found. Skipping weight learning. Using initial weights.")
-             # Ensure weights are initialized even if skipping
              if not self.weights:
                  all_feature_names = list(self.features_data.keys())
                  for name in all_feature_names:
@@ -276,11 +335,9 @@ class HoloCleanFactorGraph:
         print(f"[Model] Starting weight learning (Max Iter: {max_iter})...")
         start_time = time.time()
 
-        # Use only features that actually connect to some variable state
         feature_names_list = list(self.features_data.keys())
         if not feature_names_list:
              print("WARNING: No features found connecting to variable states. Skipping weight learning.")
-             # Initialize weights if needed
              if not self.weights:
                   all_feature_names_from_df = set(self.features_df['feature'].unique()) if self.features_df is not None else set()
                   for name in all_feature_names_from_df:
@@ -289,27 +346,39 @@ class HoloCleanFactorGraph:
 
         initial_weights_array = np.array([self.weights.get(name, self.initial_weight_value) for name in feature_names_list])
 
-        # Objective function wrapper for minimize
         objective_func = lambda w: self._calculate_log_likelihood(w, feature_names_list)
+
+        # --- Callback for logging progress ---
+        iteration_count = [0] # Use a list to allow modification within callback
+        callback_start_time = time.time()
+
+        def optimization_callback(xk):
+            iteration_count[0] += 1
+            current_time = time.time()
+            elapsed = current_time - callback_start_time
+            # Optionally, calculate objective at xk to show progress (adds overhead)
+            # current_objective = objective_func(xk)
+            # print(f"\r  Iter: {iteration_count[0]:>4}/{max_iter} | Objective: {current_objective:.4f} | Time: {elapsed:.2f}s", end="")
+            print(f"\r  Iter: {iteration_count[0]:>4}/{max_iter} | Time elapsed: {elapsed:.2f}s", end="")
+            sys.stdout.flush() # Ensure it prints immediately
+        # --- End callback definition ---
 
         try:
             opt_result = minimize(
                 objective_func,
                 initial_weights_array,
                 method='L-BFGS-B',
-                # jac=None, # Can optionally provide gradient for faster convergence
-                options={'maxiter': max_iter, 'disp': False, 'ftol': 1e-7, 'gtol': 1e-5} # Adjust tolerances if needed
+                options={'maxiter': max_iter, 'disp': False, 'ftol': 1e-7, 'gtol': 1e-5},
+                callback=optimization_callback # Pass the callback function
             )
+            print() # Newline after optimization finishes
 
             learned_weights_array = opt_result.x
-            # Check for non-finite values resulting from optimization
             if not np.all(np.isfinite(learned_weights_array)):
                 print("WARNING: Learned weights contain non-finite values (NaN/inf). Optimization likely failed. Reverting to initial weights.")
-                # Revert to initial weights to avoid issues later
                 for name in feature_names_list:
                     self.weights[name] = self.initial_weight_value
             else:
-                # Update weights dictionary
                 self.weights = dict(zip(feature_names_list, learned_weights_array))
 
             if opt_result.success:
@@ -318,25 +387,19 @@ class HoloCleanFactorGraph:
                 print(f"[Model] Weight learning finished ({opt_result.status} - {opt_result.message}). May not have fully converged.")
 
         except Exception as e:
-            print(f"ERROR during weight optimization: {e}")
+            print(f"\nERROR during weight optimization: {e}") # Add newline in case callback didn't finish line
             import traceback
             traceback.print_exc()
             print("Reverting to initial weights due to optimization error.")
-            # Revert to initial weights
             for name in feature_names_list:
                 self.weights[name] = self.initial_weight_value
 
-
-        # Optional: Print weight statistics
+        # ... (Keep the rest of the method: weight stats printing, timing) ...
         if self.weights:
             try:
                 weights_values = list(self.weights.values())
                 print(f"Learned {len(weights_values)} weights.")
                 print(f"Weight stats: Min={np.min(weights_values):.4f}, Max={np.max(weights_values):.4f}, Mean={np.mean(weights_values):.4f}, Std={np.std(weights_values):.4f}")
-                # Print top/bottom weights if desired
-                # sorted_weights = sorted(self.weights.items(), key=lambda item: abs(item[1]), reverse=True)
-                # print("Top 5 weights (abs):", sorted_weights[:5])
-                # print("Bottom 5 weights (abs):", sorted_weights[-5:])
             except Exception as e_print:
                 print(f"Could not print weight stats: {e_print}")
         else:
@@ -344,6 +407,8 @@ class HoloCleanFactorGraph:
 
         learn_time = time.time() - start_time
         print(f"[Model] Weight learning phase finished in {learn_time:.2f}s.")
+
+
 
 
     def _build_pgmpy_graph(self):
@@ -608,7 +673,6 @@ class HoloCleanFactorGraph:
             return None
 
         # 3. Learn Weights
-        print("Training weights...")
         self.fit(max_iter=learn_iter)
         # To skip learning and use initial weights:
         # if not self.weights: # Initialize if fit was skipped and they are empty

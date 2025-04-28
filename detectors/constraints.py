@@ -26,7 +26,7 @@ class ConstraintViolationDetector(BaseDetector):
                     parsed = self._parse_single_constraint(line, constraint_id=i + 1)
                     if parsed:
                         constraints.append(parsed)
-            print(f"Parsed {len(constraints)} constraints from {self.constraints_filepath}")
+            # print(f"Parsed {len(constraints)} constraints from {self.constraints_filepath}")
             return constraints
         except FileNotFoundError:
             print(f"Error: Constraint file not found at {self.constraints_filepath}")

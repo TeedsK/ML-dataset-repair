@@ -11,7 +11,7 @@ import itertools
 class DomainPruner:
     """Calculates candidate domains for cells based on co-occurrence."""
 
-    def __init__(self, db_conn, tau=0.5):
+    def __init__(self, db_conn, tau=0.01):
         """
         Initializes the DomainPruner.
 
@@ -127,6 +127,8 @@ class DomainPruner:
 
         # Iterate through all unique cells (tid, attr) from the fetched data
         for cell_index, cell_row in self.all_cells_df.iterrows():
+
+            
             tid, attr = cell_index
             original_value = cell_row['val']
 
@@ -134,6 +136,7 @@ class DomainPruner:
             if processed_count % 5000 == 0 or processed_count == total_cells_to_process :
                  print(f"Processed {processed_count}/{total_cells_to_process} cells...")
 
+            candidate_domain_before_orig = set()
             candidate_domain = set()
 
             # --- Always add the original value if it exists ---
@@ -173,7 +176,14 @@ class DomainPruner:
                          # Calculate conditional probability P(v | c')
                          cond_prob = numerator / denominator
                          if cond_prob >= self.tau:
-                             candidate_domain.add(candidate_val)
+                            #  candidate_domain.add(candidate_val)
+                             candidate_domain_before_orig.add(candidate_val)
+
+                candidate_domain.update(candidate_domain_before_orig)
+
+                if processed_count < 5: # Just print for first few for brevity
+                     print(f"[Pruner-Debug] Noisy Cell ({tid}, {attr}): Orig='{original_value}', Initial Domain Size={len(candidate_domain_before_orig)}, Final Domain Size={len(candidate_domain)}")
+
 
             # --- Add results to the insertion list ---
             # The candidate domain now contains original_value + pruned candidates (if noisy)

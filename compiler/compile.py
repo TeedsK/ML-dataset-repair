@@ -89,8 +89,10 @@ class FeatureCompiler:
             features_df = pd.read_sql(sql, self.db_conn)
             features_list = [tuple(x) for x in features_df.to_numpy()]
             duration = time.time() - start_time
-            print(f"Generated {len(features_list)} co-occurrence feature candidates in {duration:.2f}s.")
-            return self._insert_features(features_list)
+            print(f"[Compiler-Debug] Generated {len(features_list)} co-occurrence feature candidates in {duration:.2f}s.") # ADDED
+            inserted = self._insert_features(features_list)
+            print(f"[Compiler-Debug] Inserted approx {inserted} co-occurrence features.") # ADDED
+            return inserted
         except Exception as e:
             print(f"Error generating co-occurrence features: {e}")
             return 0
@@ -117,8 +119,10 @@ class FeatureCompiler:
             features_df = pd.read_sql(sql, self.db_conn)
             features_list = [tuple(x) for x in features_df.to_numpy()]
             duration = time.time() - start_time
-            print(f"Generated {len(features_list)} minimality feature candidates in {duration:.2f}s.")
-            return self._insert_features(features_list)
+            print(f"[Compiler-Debug] Generated {len(features_list)} minimality feature candidates.") # ADDED
+            inserted = self._insert_features(features_list)
+            print(f"[Compiler-Debug] Inserted approx {inserted} minimality features.") # ADDED
+            return inserted
         except Exception as e:
             print(f"Error generating minimality features: {e}")
             return 0
@@ -155,7 +159,9 @@ class FeatureCompiler:
             return 0
 
         dc_features_list = []
+        total_violating_pairs = 0
         for constraint in self.constraints:
+             constraint_violations = 0 
              print(f"Processing relaxed features for constraint {constraint['id']}...")
              # --- Find violating pairs based on initial values ---
              # (This logic mirrors the detector's check violation part)
@@ -189,6 +195,8 @@ class FeatureCompiler:
                              temp_parser = ConstraintViolationDetector(self.db_conn, self.constraints_filepath)
                              if temp_parser._check_violation(tuple1_data, tuple2_data, constraint):
                                 violating_pairs.add(pair_key)
+                                # violation_count += 1
+                                constraint_violations += 1
                                 # Add features for the cells involved in this specific violation
                                 # Feature indicates "this cell was involved in a potential violation of DC X"
                                 feature_name = f"dc_relax_{constraint['id']}"
@@ -202,13 +210,18 @@ class FeatureCompiler:
                                      if pred['a2'] in tuple2_data:
                                          original_val2 = tuple2_data[pred['a2']]
                                          dc_features_list.append((tid2, pred['a2'], original_val2, feature_name))
+            
+             print(f"[Compiler-Debug] Found {constraint_violations} violating pairs for constraint {constraint['id']}.") # ADDED
+             total_violating_pairs += constraint_violations # ADDED
 
+        print(f"[Compiler-Debug] Total violating pairs found across all DCs: {total_violating_pairs}") # ADDED
         # Remove duplicates before inserting
         unique_dc_features = list(set(dc_features_list))
         duration = time.time() - start_time
         print(f"Generated {len(unique_dc_features)} unique relaxed DC feature candidates in {duration:.2f}s.")
-        total_dc_features = self._insert_features(unique_dc_features)
-        return total_dc_features
+        inserted = self._insert_features(unique_dc_features)
+        print(f"[Compiler-Debug] Inserted approx {inserted} relaxed DC features.") # ADDED
+        return inserted
 
 
     def compile_all(self):

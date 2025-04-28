@@ -14,6 +14,8 @@
 # do not add virtual environment
 venv/
 
+.venv
+
 __pycache__
 .DS_Store
 

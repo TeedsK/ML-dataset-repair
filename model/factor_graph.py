@@ -106,11 +106,27 @@ class HoloCleanFactorGraph:
         cell_info_lookup = self.cells_df.set_index(['tid', 'attr']).to_dict('index')
 
         total_vars = 0
+        print("Sample variable names being generated:") # Add log
+        sample_vars_printed = 0
+
         for tid, attr in unique_cells:
             tid_attr = (tid, attr)
-            var_name = f"v_{tid}_{attr}"
+            # var_name = f"v_{tid}_{attr}"
+            # self.variables[tid_attr] = var_name
+            # self.graph.add_node(var_name)
+            
+            # *** Check for problematic characters in attr? ***
+            # Basic sanitation: replace spaces, maybe other chars if needed
+            safe_attr = str(attr).replace(' ', '_').replace('/', '_').replace('\\', '_')
+            var_name = f"v_{tid}_{safe_attr}" # Use safe_attr
+
+            # Print first few generated names
+            if sample_vars_printed < 5: # Add log
+                 print(f"  - ({tid}, {attr}) -> '{var_name}'") # Add log
+                 sample_vars_printed += 1 # Add log counter
+
             self.variables[tid_attr] = var_name
-            self.graph.add_node(var_name)
+            # self.graph.add_node(var_name) # Node addition moved to _add_factors_to_graph
             total_vars += 1
 
             cell_info = cell_info_lookup.get(tid_attr)
@@ -169,6 +185,7 @@ class HoloCleanFactorGraph:
                     # Set evidence
                     self.evidence_dict[var_name] = state_int
 
+        print(f"Defined {total_vars} variables mapping (tid, attr) -> var_name.")
 
         print(f"Defined {total_vars} variables (representing all cells).")
         print(f"Identified {len(self.evidence_dict)} evidence variables and {len(self.query_vars)} query variables.")
@@ -319,73 +336,210 @@ class HoloCleanFactorGraph:
 
 
     def _add_factors_to_graph(self):
-        """Adds factors to the pgmpy graph using the learned weights."""
-        print("[Model] Adding factors to pgmpy graph...")
+        """Adds factors to the pgmpy graph using the learned weights.
+           *** HYBRID APPROACH: Use add_factors first, then ensure structure manually ***
+        """
+        print("[Model] Adding factors to pgmpy graph (Hybrid add_factors + Manual method)...")
         start_time = time.time()
-        self.graph = FactorGraph() # Recreate graph to clear old factors/nodes
+        self.graph = FactorGraph() # Re-initialize
 
-        # Add nodes first
-        for var_name in self.variables.values():
-            self.graph.add_node(var_name)
+        # --- Add Variable Nodes ---
+        variable_node_names = list(self.variables.values())
+        self.graph.add_nodes_from(variable_node_names)
+        print(f"Added {len(self.graph.nodes())} variable nodes to graph.")
+        variable_nodes_set = set(self.graph.nodes()) # Keep track
 
-        factors_added_count = 0
-        # --- Add Unary Factors from Features ---
-        var_potentials = defaultdict(lambda: defaultdict(float)) # {var_name: {state: log_potential_sum}}
+        # --- Create Factor Objects (Feature + Default) ---
+        # Store all created factor objects in a list
+        all_factor_objects = []
+        # Map variable name to its corresponding factor object for easy lookup later
+        variable_to_factor_map = {}
+        factors_created_count = 0
+        default_factors_created = 0
+        problematic_factors = 0
 
+        # --- Step 1a: Create Feature Factor Objects ---
+        var_potentials = defaultdict(lambda: defaultdict(float))
+        # ... (calculation of var_potentials - same as before) ...
         for feature_name, affected_states in self.features_data.items():
-            weight = self.weights.get(feature_name, 0.0)
-            # Clip weights to prevent overflow in exp()
-            clipped_weight = np.clip(weight, -700, 700) # exp(700) is large but avoids immediate overflow
+             weight = self.weights.get(feature_name, 0.0)
+             clipped_weight = np.clip(weight, -700, 700)
+             for var_name, state_int in affected_states:
+                  if var_name in self.variable_states:
+                     var_potentials[var_name][state_int] += clipped_weight
 
-            for var_name, state_int in affected_states:
-                 # Sum weights in log space
-                 var_potentials[var_name][state_int] += clipped_weight
-
-
-        # Create one factor per variable from the summed log potentials
+        print("Creating factors from features...")
         for var_name, state_log_potentials in var_potentials.items():
-             if var_name not in self.variable_states: continue # Skip if variable definition missing
+             if var_name not in self.variable_states: continue
+             if var_name not in variable_nodes_set: continue # Ensure node exists
 
              var_cardinality = len(self.variable_states[var_name])
-             # Initialize factor log values to 0
-             factor_log_values = np.zeros(var_cardinality)
+             if var_cardinality == 0: continue
 
+             # ... (factor value calculation - same as before) ...
+             factor_log_values = np.zeros(var_cardinality)
              for state_int, log_potential_sum in state_log_potentials.items():
                  if 0 <= state_int < var_cardinality:
                      factor_log_values[state_int] = log_potential_sum
-
-             # Convert log potentials to potentials: exp(log_values)
-             # Handle potential underflow/overflow with stabilization
              max_log_val = np.max(factor_log_values)
-             if np.isinf(max_log_val): max_log_val = 700 # Avoid inf
+             if np.isinf(max_log_val): max_log_val = 700
              stable_log_values = factor_log_values - max_log_val
-             factor_values = np.exp(stable_log_values) + self.epsilon # Add epsilon for stability
+             factor_values = np.exp(stable_log_values)
+
+             factor_vars = [var_name]
+             is_problematic = False
+             # ... (check factor_values for NaN/inf/zero - same as before) ...
+             if not np.all(np.isfinite(factor_values)):
+                 print(f"DEBUG: Feature factor for {var_name} has non-finite values. Replacing with ones.")
+                 factor_values = np.ones(var_cardinality)
+                 is_problematic = True
+             elif np.sum(factor_values) < self.epsilon:
+                 print(f"DEBUG: Feature factor for {var_name} has near-zero sum. Replacing with ones.")
+                 factor_values = np.ones(var_cardinality)
+                 is_problematic = True
+
+             if is_problematic: problematic_factors += 1
 
              try:
-                factor = DiscreteFactor(
-                    variables=[var_name],
-                    cardinality=[var_cardinality],
-                    values=factor_values
-                )
-                self.graph.add_factors(factor)
-                factors_added_count += 1
-             except ValueError as ve:
-                 print(f"Error creating factor for {var_name}: {ve}")
-                 print(f"  Cardinality: {var_cardinality}")
-                 print(f"  Values shape: {factor_values.shape}")
-                 print(f"  Values: {factor_values}")
+                 factor = DiscreteFactor(factor_vars, [var_cardinality], factor_values)
+                 all_factor_objects.append(factor) # Add to list
+                 variable_to_factor_map[var_name] = factor # Add to map
+                 factors_created_count += 1
+             except Exception as e:
+                 print(f"Error creating feature factor object for {var_name}: {e}")
+                 problematic_factors += 1
+
+        # --- Step 1b: Create Default Uniform Factor Objects ---
+        print(f"Creating default factors for variables without feature factors...")
+        variables_needing_default = variable_nodes_set - set(variable_to_factor_map.keys())
+
+        for var_name in variables_needing_default:
+            if var_name not in self.variable_states: continue
+            if var_name not in variable_nodes_set: continue
+
+            var_cardinality = len(self.variable_states[var_name])
+            if var_cardinality == 0: continue
+
+            factor_vars = [var_name]
+            factor_values = np.ones(var_cardinality)
+
+            try:
+                 factor = DiscreteFactor(factor_vars, [var_cardinality], factor_values)
+                 all_factor_objects.append(factor) # Add to list
+                 variable_to_factor_map[var_name] = factor # Add to map
+                 default_factors_created += 1
+            except Exception as e:
+                 print(f"Error creating default factor object for {var_name}: {e}")
+                 problematic_factors += 1
+
+        duration_creation = time.time() - start_time
+        print(f"Created {factors_created_count} factors from features and {default_factors_created} default factors in {duration_creation:.2f}s (Object creation only).")
+        print(f"Total factor objects created: {len(all_factor_objects)}")
+        if problematic_factors > 0:
+            print(f"WARNING: Encountered {problematic_factors} potential problems during factor object creation.")
+        if len(all_factor_objects) != len(variable_nodes_set):
+             print(f"CRITICAL WARNING: Number of factors created ({len(all_factor_objects)}) does not match number of variables ({len(variable_nodes_set)}).")
 
 
-        # --- Add Cardinality Factors (Now potentially necessary) ---
-        # Since we combined feature weights into single factors per variable,
-        # the sampling might not implicitly enforce the categorical constraint.
-        # Add a factor for each variable ensuring only one state is '1'.
-        # This is hard to enforce directly in standard Gibbs. Let's rely on the
-        # categorical nature of the sampling process itself for now. If results
-        # are poor, explicit constraint factors might be needed, making inference harder.
+        # --- Step 2: Use add_factors to register factors internally ---
+        print(f"Registering {len(all_factor_objects)} factors using self.graph.add_factors...")
+        start_add_factors_time = time.time()
+        if all_factor_objects:
+            try:
+                 self.graph.add_factors(*all_factor_objects)
+                 add_factors_duration = time.time() - start_add_factors_time
+                 print(f"Finished add_factors registration in {add_factors_duration:.2f}s.")
+                 # Check if get_factors works now
+                 print(f"DEBUG: Factors found by get_factors() after add_factors: {len(self.graph.get_factors())}")
+            except Exception as e:
+                 print(f"ERROR during self.graph.add_factors: {e}")
+                 import traceback
+                 traceback.print_exc()
+                 print("Aborting factor addition.")
+                 return # Don't proceed if add_factors failed
+        else:
+             print("Warning: No factors were created to register.")
 
-        duration = time.time() - start_time
-        print(f"Added {factors_added_count} factors (one per variable with features) in {duration:.2f}s.")
+
+        # --- Step 3: Manually add Factor Nodes and Edges (potentially redundant but ensures structure) ---
+        print("Ensuring bipartite structure by manually adding factor nodes and edges...")
+        start_manual_add_time = time.time()
+        edges_added_count = 0
+        factor_nodes_added_manually = set() # Track nodes added in this step
+        variables_connected_by_edges = set()
+
+        # Iterate through the map we created earlier
+        for var_name, factor in variable_to_factor_map.items():
+             # Ensure factor is valid
+             if not isinstance(factor, DiscreteFactor): continue
+             # Ensure variable node exists
+             if not self.graph.has_node(var_name):
+                  print(f"ERROR: Variable node '{var_name}' missing before manual edge add. Skipping.")
+                  continue
+
+             try:
+                # 1. Add the factor object AS A NODE if not already present
+                #    (add_factors might or might not have added it as a node)
+                if not self.graph.has_node(factor):
+                    self.graph.add_node(factor)
+                factor_nodes_added_manually.add(factor) # Track attempt
+
+                # 2. Add edge between the variable node and the factor node if not already present
+                edge = (var_name, factor)
+                if not self.graph.has_edge(*edge):
+                     # Double check nodes exist before adding edge
+                    if self.graph.has_node(var_name) and self.graph.has_node(factor):
+                         self.graph.add_edge(*edge)
+                         edges_added_count += 1
+                    else:
+                         print(f"ERROR: Nodes for edge {edge} not found before adding edge.")
+
+                # Always mark the variable as intended to be connected
+                variables_connected_by_edges.add(var_name)
+
+             except Exception as e:
+                 print(f"Error during manual node/edge addition for var '{var_name}': {e}")
+
+        manual_add_duration = time.time() - start_manual_add_time
+        print(f"Finished manual node/edge structure check/addition in {manual_add_duration:.2f}s.")
+        print(f"DEBUG: Manually added/ensured {edges_added_count} edges.")
+
+
+        # --- Step 4: Log final graph state ---
+        print("--- Graph State After Hybrid Addition ---")
+        current_nodes = self.graph.nodes()
+        current_edges = self.graph.edges()
+        current_factors = self.graph.get_factors() # Check again
+        print(f"Nodes: {len(current_nodes)}")
+        print(f"Edges: {len(current_edges)}")
+        print(f"Factors (via get_factors()): {len(current_factors)}")
+
+        # Check node types
+        final_variable_nodes = set(n for n in current_nodes if isinstance(n, str))
+        final_factor_nodes = set(n for n in current_nodes if isinstance(n, DiscreteFactor))
+        print(f"Final variable nodes identified: {len(final_variable_nodes)}")
+        print(f"Final factor nodes identified: {len(final_factor_nodes)}")
+
+        # Verify counts and connectivity
+        expected_node_count = len(variable_nodes_set) + len(final_factor_nodes) # Should include factors as nodes
+        if len(current_nodes) != expected_node_count:
+             print(f"WARNING: Node count mismatch! Actual: {len(current_nodes)}, Expected (vars + unique factors): {expected_node_count}")
+             other_nodes = set(n for n in current_nodes if not isinstance(n, (str, DiscreteFactor)))
+             if other_nodes: print(f"  Nodes with unexpected types found: {set(type(n) for n in other_nodes)}")
+
+
+        if len(current_edges) != len(variable_nodes_set): # Expect one edge per variable ultimately
+             print(f"WARNING: Final edge count ({len(current_edges)}) doesn't match variable count ({len(variable_nodes_set)})")
+             # Check for unconnected variables again
+             vars_in_edges = set(u for u, v in current_edges if isinstance(u, str)) | set(v for u, v in current_edges if isinstance(v, str))
+             unconnected_vars = variable_nodes_set - vars_in_edges
+             if unconnected_vars:
+                  print(f"CRITICAL ERROR: {len(unconnected_vars)} variable nodes still seem unconnected!")
+                  print(f"  Unconnected examples: {list(unconnected_vars)[:20]}...")
+
+        print("---------------------------------------")
+        # The rest of the infer method (check_model, sampling) will proceed from here...
+
 
 
     def infer(self, n_samples=1000, n_burn_in=200):
@@ -397,58 +551,171 @@ class HoloCleanFactorGraph:
         print(f"[Model] Starting Gibbs sampling ({n_samples} samples, {n_burn_in} burn-in)...")
         start_time = time.time()
 
-        self._add_factors_to_graph()
-        if not self.graph.get_factors():
-             print("Warning: No factors added to the graph. Inference might yield uniform probabilities.")
-             # If no factors, maybe return uniform marginals? Or empty?
-             return {} # Return empty if no factors to sample from
+        self._add_factors_to_graph() # Now adds default factors
+
+        # Check factors again after adding defaults
+        # if not self.graph.get_factors():
+        #      print("Error: No factors found in the graph even after adding defaults. Aborting.")
+        #      return {}
+        # if len(self.graph.get_factors()) != len(self.graph.nodes()):
+        #     print(f"Error: Factor count ({len(self.graph.get_factors())}) still doesn't match node count ({len(self.graph.nodes())}). Aborting.")
+        #     # Find nodes without factors
+        #     nodes_with_factors = set()
+        #     for factor in self.graph.get_factors():
+        #         nodes_with_factors.update(factor.variables)
+        #     missing_factor_nodes = set(self.graph.nodes()) - nodes_with_factors
+        #     print(f"Nodes missing factors: {list(missing_factor_nodes)[:20]}...") # Print first few
+        #     return {}
+
+        # # *** REFINED MANUAL CHECK: Compare complete variable sets ***
+        # print("Manually checking factors vs nodes BEFORE check_model()...")
+        # manual_check_failed = False
+        # current_nodes_set = set(self.graph.nodes())
+        # if not current_nodes_set:
+        #      print("ERROR: Graph has no nodes!")
+        #      manual_check_failed = True
+
+        # actual_factors = self.graph.get_factors()
+        # print(f"Found {len(actual_factors)} factors in graph object.")
+
+        # # Collect all unique variables mentioned in all factors
+        # all_vars_in_factors = set()
+        # factors_with_empty_vars = 0
+        # for factor in actual_factors:
+        #     if not factor.variables:
+        #         factors_with_empty_vars += 1
+        #     else:
+        #         # Add variables from this factor to the set
+        #         all_vars_in_factors.update(factor.variables)
+
+        # if factors_with_empty_vars > 0:
+        #     print(f"ERROR: Found {factors_with_empty_vars} factors with no associated variables!")
+        #     manual_check_failed = True
+
+        # print(f"Total unique variables mentioned across all factors: {len(all_vars_in_factors)}")
+        # print(f"Total nodes in graph: {len(current_nodes_set)}")
+
+        # # Check 1: Are there variables in factors that are not nodes?
+        # vars_in_factors_not_nodes = all_vars_in_factors - current_nodes_set
+        # if vars_in_factors_not_nodes:
+        #     print(f"ERROR: Variables found in factors but not in graph nodes: {list(vars_in_factors_not_nodes)[:20]}...")
+        #     manual_check_failed = True
+
+        # # Check 2: Are there nodes that are not mentioned in any factor?
+        # # (This check corresponds to the *previous* error, should pass now)
+        # nodes_not_in_factors = current_nodes_set - all_vars_in_factors
+        # if nodes_not_in_factors:
+        #     print(f"ERROR: Nodes found in graph but not in any factor's scope: {list(nodes_not_in_factors)[:20]}...")
+        #     # This indicates the default factor addition might have missed some nodes
+        #     manual_check_failed = True
+
+
+        # if manual_check_failed:
+        #     print("Manual check failed. Aborting before pgmpy check_model().")
+        #     return {}
+        # else:
+        #     print("Manual check comparing factor variables and graph nodes passed.")
+
+        print("Checking graph model validity...")
+        try:
+            # This should now pass if the bipartite structure is correct
+            print('--------------')
+            print("Graph model before check_model():")
+            print("Nodes:", len(self.graph.nodes()))
+            print("Factors:", len(self.graph.get_factors()))
+            print("Edges:", len(self.graph.edges()))
+            print("Variable states:", len(self.variable_states))
+            print("Candidate map:", len(self.candidate_map))
+            print("Weights:", len(self.weights))
+            print("Features data:", len(self.features_data))
+            print("Evidence dict:", len(self.evidence_dict))
+            print("Query vars:", len(self.query_vars))
+            print("Graph object:", len(self.graph))
+            print('--------------')
+            check_result = self.graph.check_model()
+            print("Graph model check passed.")
+        except Exception as e:
+            print(f"Graph model check raised an exception: {e}")
+            import traceback
+            traceback.print_exc()
+            print("Aborting inference due to graph check failure.")
+            return {}
+
 
         gibbs = GibbsSampling(self.graph)
 
-        start_state = {}
-        # Initialize ALL variables: evidence fixed, query random
-        for var_name in self.graph.nodes(): # Iterate through all nodes added
+        # --- Build start_state_list (Corrected Debug Logic) ---
+        start_state_dict = {} # First build the dictionary
+        # Get variable nodes *from the graph* after check_model passed
+        # Or rely on self.variables keys mapping to the names added
+        variable_nodes_in_graph = [node for node in self.graph.nodes() if isinstance(node, str)] # Assuming var names are strings
+        variable_nodes_in_graph.sort()
+
+        print("Building start state dictionary...")
+        for var_name in variable_nodes_in_graph:
+            state_assigned = -1
             if var_name in self.evidence_dict:
-                start_state[var_name] = self.evidence_dict[var_name]
+                state_assigned = self.evidence_dict[var_name]
             else:
-                num_states = len(self.variable_states.get(var_name, {}))
+                var_states = self.variable_states.get(var_name, {})
+                num_states = len(var_states)
                 if num_states > 0:
-                     start_state[var_name] = random.randint(0, num_states - 1)
+                     state_assigned = random.randint(0, num_states - 1)
                 else:
-                     # Handle variable with no states - assign a dummy state? Or skip?
-                     # Assigning 0, but this variable shouldn't exist ideally.
-                     start_state[var_name] = 0
-                     print(f"Warning: Variable {var_name} has no defined states. Assigning state 0.")
+                     state_assigned = 0 # Default for vars with no states
+
+            # Verify assigned state is valid *before* adding to dict
+            var_states = self.variable_states.get(var_name, {})
+            num_states = len(var_states)
+            if not (0 <= state_assigned < num_states):
+                 print(f"  - WARNING: Assigned start state {state_assigned} for {var_name} is OUT OF BOUNDS for cardinality {num_states}. Resetting to 0.")
+                 state_assigned = 0 if num_states > 0 else 0 # Assign 0 if possible, else keep 0
+
+            start_state_dict[var_name] = state_assigned
+
+        # Now build the list of tuples from the verified dictionary
+        start_state_list = []
+        print("Verifying start state consistency (first 10 variables)...")
+        verified_count = 0
+        for var_name in variable_nodes_in_graph: # Iterate in sorted order
+             state_assigned = start_state_dict[var_name] # Get from the verified dict
+             start_state_list.append(tuple([var_name, state_assigned]))
+
+             # Print details for the first few
+             if verified_count < 10:
+                  var_states = self.variable_states.get(var_name, {})
+                  num_states = len(var_states)
+                  state_map_str = str(var_states)
+                  if len(state_map_str) > 100: state_map_str = state_map_str[:100] + "..."
+                  print(f"  - {var_name}: States={state_map_str} (Card={num_states}), StartState={state_assigned}")
+             verified_count += 1
 
 
-        start_state_list = [tuple([var, state]) for var, state in start_state.items()]
-        # Ensure start_state_list covers all nodes in the graph
-        if len(start_state_list) != len(self.graph.nodes()):
-             print(f"Error: Start state length ({len(start_state_list)}) doesn't match graph nodes ({len(self.graph.nodes())}).")
-             # Find missing nodes maybe?
-             missing_nodes = set(self.graph.nodes()) - set(s[0] for s in start_state_list)
-             print(f"Missing nodes: {missing_nodes}")
-             return {} # Cannot proceed
+        if len(start_state_list) != len(variable_nodes_in_graph):
+             print(f"Error: Start state list length ({len(start_state_list)}) doesn't match graph variable nodes ({len(variable_nodes_in_graph)}).")
+             return {}
 
+        variable_order = [s[0] for s in start_state_list]
 
-        print("Generating samples (this may take time)...")
+        print("Generating samples (this may time)...")
+        # ... (Sampling loop remains the same as the last working version - expecting list/tuple samples) ...
         samples_list = []
         try:
-            # Set show_progress=False as manual printing is done
             sample_generator = gibbs.generate_sample(start_state=start_state_list, size=n_samples + n_burn_in, seed=42)
-
+            # ... (rest of the loop from previous correct version) ...
             progress_interval = (n_samples + n_burn_in) // 10
             if progress_interval == 0: progress_interval = 1
 
             for i, sample in enumerate(sample_generator):
-                # Check sample format - should be a list/tuple of states
-                if not isinstance(sample, (list, tuple)) or len(sample) != len(start_state_list):
-                     print(f"Error: Unexpected sample format at iteration {i}. Got: {sample}")
-                     # Should be list of states like [0, 1, 0, ...]
-                     # If it's state names, need to map back based on variable_order
-                     # Let's assume it returns states corresponding to start_state order
+                if isinstance(sample, (list, tuple)) and len(sample) == len(variable_order):
+                     samples_list.append(sample)
+                elif sample == []:
+                     print(f"Error: Gibbs sampler returned empty list [] at iteration {i}. Aborting.")
+                     return {}
+                else:
+                     print(f"Error: Unexpected sample format at iteration {i}. Expected list/tuple of length {len(variable_order)}, Got type: {type(sample)}, Length: {len(sample) if hasattr(sample, '__len__') else 'N/A'}")
                      return {} # Cannot proceed
-                samples_list.append(sample)
+
                 if (i + 1) % progress_interval == 0:
                     print(f"  Generated {i + 1}/{n_samples + n_burn_in} samples...")
 
@@ -456,21 +723,25 @@ class HoloCleanFactorGraph:
              print(f"Error during Gibbs sampling generation: {e}")
              import traceback
              traceback.print_exc()
-             return {} # Stop inference on error
+             return {}
 
 
         if not samples_list:
-             print("Error: No samples generated by Gibbs sampler.")
+             print("Error: No valid samples generated by Gibbs sampler.")
              return {}
 
-        # Convert list of samples (tuples/lists of state values) to DataFrame
-        variable_order = [s[0] for s in start_state_list] # Get variable names in order
+        # --- Convert list of samples (lists of state values) to DataFrame ---
+        # variable_order is already defined and sorted before the loop
         samples_array = np.array(samples_list)
 
         try:
             # Ensure correct shape before creating DataFrame
-            if samples_array.shape != (len(samples_list), len(variable_order)):
-                 raise ValueError(f"Shape mismatch: samples_array {samples_array.shape}, expected {(len(samples_list), len(variable_order))}")
+            if len(samples_list) == 0: # Check if list is empty after potential skips
+                 print("Error: No samples collected after filtering.")
+                 return {}
+            if samples_array.shape[1] != len(variable_order):
+                 raise ValueError(f"Shape mismatch: samples_array columns ({samples_array.shape[1]}) != variable_order length ({len(variable_order)})")
+
             samples_df = pd.DataFrame(samples_array, columns=variable_order)
         except ValueError as e:
              print(f"Error creating DataFrame from samples: {e}")

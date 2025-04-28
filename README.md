@@ -54,6 +54,32 @@ This project aims to re-implement the HoloClean data cleaning system.
             * `SELECT COUNT(DISTINCT tid) FROM cells;` (Verify the count matches #rows in CSV)
             * `SELECT * FROM cells LIMIT 5;` (Inspect sample data)
 
+## Command for venv on Mac
+```
+python -m venv .venv
+source .venv/bin/activate
+
+```
+
+## Order to run commands
+```
+python ingest.py
+# add --limit 300 to limit it to the first 300 rows of data
+
+# 2. Run Error Detectors
+python run_detectors.py
+
+# 3. Run Pruning (generates domains - uses features)
+python run_pruning.py
+
+# 4. Run Compiler (generates features - uses detected errors)
+python run_compiler.py
+
+# 5. Run Inference (uses domains and features)
+#    (Use fewer samples/burn-in for faster testing if needed)
+python run_inference.py --samples 50 --burnin 10
+```
+
 ### Stopping the Database
 
 To stop the database container when you're done:

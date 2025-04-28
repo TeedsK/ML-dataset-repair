@@ -14,6 +14,7 @@ def main():
     parser.add_argument('--samples', type=int, default=1000, help='Number of Gibbs samples.')
     parser.add_argument('--burnin', type=int, default=200, help='Number of Gibbs burn-in samples.')
     parser.add_argument('--learniter', type=int, default=100, help='Max iterations for weight learning.')
+    parser.add_argument('--lr', type=float, default=0.01, help='Learning rate for Adam optimizer.')
     parser.add_argument('--outfile', type=str, default='inference_marginals.pkl', help='File to save the resulting marginals.')
     args = parser.parse_args()
 
@@ -33,7 +34,8 @@ def main():
         marginals = model.run_pipeline(
             n_samples=args.samples,
             n_burn_in=args.burnin,
-            learn_iter=args.learniter
+            learn_iter=args.learniter,
+            learning_rate=args.lr
         )
 
         if marginals is not None:

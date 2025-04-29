@@ -1,5 +1,5 @@
 # File: compiler/compile.py
-# Compiles signals into features using UNIQUE FEATURE NAMES (removed hashing).
+# Compiles signals into features, RE-INTRODUCING HASHING with a LARGER size.
 
 import pandas as pd
 import time
@@ -8,24 +8,27 @@ import psycopg2.extras
 from collections import defaultdict
 import itertools
 import logging
-# import hashlib # No longer needed for primary feature hashing
+import hashlib # Using hashlib for potentially better distribution than built-in hash
 
 from detectors.constraints import ConstraintViolationDetector
 
 NULL_REPR_PLACEHOLDER = "__NULL__"
-# FEATURE_HASH_SIZE = 5000 # No longer used for feature names
-
+# --- Define HASH Size ---
+# Choose a size based on available memory and desired granularity.
+# Increase significantly from 5000. Try 100k, 500k, or 1M as starting points.
+# Let's try 200,000. Adjust if needed based on memory/performance.
+FEATURE_HASH_SIZE = 200000 # ADJUST THIS VALUE AS NEEDED
+# --- END Define HASH Size ---
 
 class FeatureCompiler:
-    """Generates features for the HoloClean probabilistic model using unique names."""
+    """Generates features for the HoloClean probabilistic model using hashing."""
 
     def __init__(self, db_conn, relax_constraints=True, constraints_filepath="hospital_constraints.txt"):
         self.db_conn = db_conn
-        self.relax_constraints = relax_constraints # Keep flag, but logic might need more work
+        self.relax_constraints = relax_constraints
         self.constraints_filepath = constraints_filepath
         self.constraints = []
         self.detector_helper = None
-        # Ensure detector_helper is initialized to access _check_violation if needed
         try:
             self.detector_helper = ConstraintViolationDetector(db_conn, constraints_filepath)
             self.constraints = self.detector_helper.constraints
@@ -35,7 +38,6 @@ class FeatureCompiler:
             self.constraints = []
 
     def _clear_features(self):
-        # (Keep this method as is)
         logging.info("[Compiler] Clearing existing features...")
         try:
             with self.db_conn.cursor() as cur:
@@ -48,53 +50,61 @@ class FeatureCompiler:
             logging.error(f"[Compiler] Error clearing features table: {e}", exc_info=True)
             return False
 
-    # No longer needed: _hash_feature
+    # --- RE-ADDED Hashing Function ---
+    def _hash_feature(self, feature_name_str):
+        """Hashes a feature string to an index within FEATURE_HASH_SIZE."""
+        hasher = hashlib.sha1(feature_name_str.encode('utf-8'))
+        hash_bytes = hasher.digest()[:4] # Use first 4 bytes for ~4 billion range before modulo
+        hash_int = int.from_bytes(hash_bytes, 'big', signed=False)
+        # Add 1 to reserve index 0? Or handle potential 0 hash if needed.
+        # Let's map to 0..HASH_SIZE-1 for now.
+        hash_index = hash_int % FEATURE_HASH_SIZE
+        # Return as string 'h_INDEX' to distinguish from prior feature?
+        # Or rely on prior having a non-numeric name? Let's return string hash id.
+        return f'h_{hash_index}' # Prefix to make it clearly a hashed feature string
+    # --- END RE-ADDED Hashing Function ---
+
 
     def _insert_features(self, features_list):
         """
         Inserts features. Expects list of tuples:
-        (tid, attr, candidate_val, feature_name_string)
+        (tid, attr, candidate_val, feature_identifier_string)
         """
         if not features_list:
             logging.warning("[Compiler] No features generated to insert.")
             return 0
 
-        # Deduplicate features before insertion
         unique_features_set = set(features_list)
         unique_features_list = list(unique_features_set)
 
         inserted_count = 0
-        # --- MODIFIED SQL: Store unique feature name string ---
+        # Feature column is TEXT, so strings ('prior_minimality', 'h_12345') are fine.
         sql_insert = """
             INSERT INTO features (tid, attr, candidate_val, feature)
             VALUES (%s, %s, %s, %s)
             ON CONFLICT (tid, attr, candidate_val, feature) DO NOTHING;
         """
-        # --- END MODIFIED SQL ---
-        logging.info(f"[Compiler] Attempting to insert {len(unique_features_list)} unique named features...")
+        logging.info(f"[Compiler] Attempting to insert {len(unique_features_list)} unique feature identifiers...")
         insert_start_time = time.time()
         try:
             with self.db_conn.cursor() as cur:
-                 # Data should already be (tid, attr, cand_val, feature_name_str)
-                 psycopg2.extras.execute_batch(cur, sql_insert, unique_features_list, page_size=10000) # Increased page size
-                 inserted_count = len(unique_features_list) # This is approximate due to ON CONFLICT
+                 psycopg2.extras.execute_batch(cur, sql_insert, unique_features_list, page_size=10000)
+                 inserted_count = len(unique_features_list)
             self.db_conn.commit()
             insert_time = time.time() - insert_start_time
-            logging.info(f"[Compiler] Named feature insertion complete in {insert_time:.2f} seconds ({inserted_count} unique features targeted).")
-            # We can't easily get exact inserted count with ON CONFLICT, but this is the target count
+            logging.info(f"[Compiler] Feature insertion complete in {insert_time:.2f} seconds ({inserted_count} unique features targeted).")
             return inserted_count
         except Exception as e:
             self.db_conn.rollback()
-            logging.error(f"[Compiler] Error inserting named features: {e}", exc_info=True)
+            logging.error(f"[Compiler] Error inserting features: {e}", exc_info=True)
             return 0
 
 
     def generate_cooccurrence_features(self):
         """
-        Generates named co-occurrence features.
-        Feature Name: cooc_{attr}={candidate_val}_{other_attr}={other_val}
+        Generates HASHED co-occurrence features using a larger hash space.
         """
-        logging.info("[Compiler] Generating NAMED co-occurrence features...")
+        logging.info("[Compiler] Generating HASHED co-occurrence features...")
         start_time = time.time()
         sql = f"""
             SELECT
@@ -109,41 +119,33 @@ class FeatureCompiler:
         """
         features_list = []
         try:
-            # Use a server-side cursor for potentially large results
-            with self.db_conn.cursor(name='named_cooc_feature_cursor') as cur:
+            with self.db_conn.cursor(name='hashed_cooc_feature_cursor') as cur:
                  cur.itersize = 50000 # Adjust buffer size
                  cur.execute(sql)
                  processed_rows = 0
                  for row in cur:
                      tid, attr, candidate_val_str, other_attr, other_val_str = row[0], row[1], str(row[2]), row[3], str(row[4])
-                     # --- Use unique feature name ---
-                     # Sanitize values for feature names if they contain special characters? For now, assume simple strings.
-                     # Consider length limits if names become too long.
+                     # Construct the specific feature name before hashing
                      feature_name = f'cooc_{attr}={candidate_val_str}_{other_attr}={other_val_str}'
-                     # --- END Use unique feature name ---
-                     features_list.append((tid, attr, candidate_val_str, feature_name))
+                     # --- Hash the feature name ---
+                     feature_hash_id = self._hash_feature(feature_name)
+                     # --- END Hash the feature name ---
+                     features_list.append((tid, attr, candidate_val_str, feature_hash_id)) # Store hash ID string
                      processed_rows += 1
-                     # Optional: Insert in batches within the loop if memory becomes an issue
-                     # if len(features_list) >= BATCH_SIZE:
-                     #     self._insert_features(features_list)
-                     #     features_list = []
 
-            # Insert any remaining features
             inserted = self._insert_features(features_list)
-
             duration = time.time() - start_time
-            logging.info(f"[Compiler] Generated {len(features_list)} named co-occurrence feature instances from {processed_rows} DB rows in {duration:.2f}s.")
-            logging.info(f"[Compiler] Inserted approx {inserted} unique named co-occurrence features.")
+            logging.info(f"[Compiler] Generated {len(features_list)} hashed co-occurrence feature instances from {processed_rows} DB rows in {duration:.2f}s.")
+            logging.info(f"[Compiler] Inserted approx {inserted} unique hashed co-occurrence features.")
             return inserted
         except Exception as e:
-            logging.error(f"Error generating named co-occurrence features: {e}", exc_info=True)
+            logging.error(f"Error generating hashed co-occurrence features: {e}", exc_info=True)
             return 0
 
 
     def generate_minimality_features(self):
-        """Generates the minimality prior feature (unique name)."""
-        # This feature typically has a single, non-hashed name.
-        logging.info("[Compiler] Generating minimality prior features...")
+        """Generates the minimality prior feature (still unique name)."""
+        logging.info("[Compiler] Generating minimality prior features (non-hashed)...")
         start_time = time.time()
         prior_feature_name = 'prior_minimality' # Keep original unique name
         sql = f"""
@@ -154,10 +156,9 @@ class FeatureCompiler:
             FROM domains d
             JOIN cells c ON d.tid = c.tid AND d.attr = c.attr
             WHERE
-                -- Check if candidate matches original value (handling NULLs)
                 (c.val IS NULL AND d.candidate_val = '{NULL_REPR_PLACEHOLDER}')
                 OR
-                (c.val IS NOT NULL AND d.candidate_val = CAST(c.val AS TEXT)); -- Ensure comparison as text
+                (c.val IS NOT NULL AND d.candidate_val = CAST(c.val AS TEXT));
         """
         features_list = []
         try:
@@ -165,16 +166,13 @@ class FeatureCompiler:
                  cur.execute(sql)
                  processed_rows = 0
                  for row in cur:
-                      # Store the original feature name
                       features_list.append((row[0], row[1], str(row[2]), prior_feature_name))
                       processed_rows += 1
 
-            # Insert using the general insert method now
             inserted = self._insert_features(features_list)
-
             duration = time.time() - start_time
             logging.info(f"[Compiler] Generated {len(features_list)} minimality feature instances from {processed_rows} DB rows in {duration:.2f}s.")
-            logging.info(f"[Compiler] Inserted approx {inserted} minimality features (should be 1 unique name).")
+            logging.info(f"[Compiler] Inserted approx {inserted} minimality features.")
             return inserted
         except Exception as e:
             logging.error(f"Error generating minimality features: {e}", exc_info=True)
@@ -183,8 +181,7 @@ class FeatureCompiler:
 
     def generate_relaxed_dc_features(self):
         """
-        Generates NAMED features based on potential DC violations (using original relaxed logic).
-        Feature Name: RelaxDCViolates:{constraint_id}:Cell={tid},{attr}:Cand={candidate_val}
+        Generates HASHED features based on potential DC violations.
         """
         if not self.relax_constraints:
             logging.info("[Compiler] Skipping relaxed DC features (relax_constraints=False).")
@@ -193,19 +190,17 @@ class FeatureCompiler:
              logging.warning("[Compiler] No constraints loaded/parsed or detector helper missing. Cannot generate relaxed DC features.")
              return 0
 
-        logging.info("[Compiler] Generating NAMED relaxed denial constraint features...")
+        logging.info("[Compiler] Generating HASHED relaxed denial constraint features...")
         total_dc_features_generated = 0
         start_time = time.time()
 
         logging.info("[Compiler-RelaxDC] Fetching initial cell values...")
         tuple_data_cache = defaultdict(dict)
         try:
-            # Fetch data including NULLs
             with self.db_conn.cursor(name='cell_data_cursor_dc') as cur:
                 cur.itersize = 50000
                 cur.execute("SELECT tid, attr, val FROM cells")
                 for tid, attr, val in cur:
-                     # Use placeholder for NULLs in the cache
                      tuple_data_cache[int(tid)][attr] = NULL_REPR_PLACEHOLDER if pd.isna(val) else val
             logging.info(f"[Compiler-RelaxDC] Built initial value cache for {len(tuple_data_cache)} tuples.")
         except Exception as e:
@@ -229,27 +224,25 @@ class FeatureCompiler:
         processed_constraints = 0
 
         for constraint in self.constraints:
-            constraint_id_str = str(constraint['id']) # Use for feature name
+            constraint_id_str = str(constraint['id'])
             logging.debug(f"[Compiler-RelaxDC] Processing Constraint {constraint_id_str}")
 
-            # Find pairs initially violating the constraint (reusing detector logic)
-            # Note: This part can be slow if not optimized. Consider pre-calculating violations.
-            # Let's reuse the pair finding logic from your original code for now.
+            # Find pairs initially violating the constraint
+            # (Reusing original logic, potentially slow)
             eq_preds = [p for p in constraint['predicates'] if p['type'] == 'EQ']
             if not eq_preds: continue
             key_attr1 = eq_preds[0]['a1']
             sql_fetch_keys = f"SELECT tid, val FROM cells WHERE attr = %s AND val IS NOT NULL;"
             try:
-                 # Use pandas read_sql directly, ensure correct type handling
                  key_df = pd.read_sql(sql_fetch_keys, self.db_conn, params=(key_attr1,))
-                 key_df['tid'] = key_df['tid'].astype(int) # Ensure tid is int
+                 key_df['tid'] = key_df['tid'].astype(int)
             except Exception as e:
                  logging.warning(f"Error fetching keys for constraint {constraint_id_str}, skipping: {e}")
                  continue
 
             grouped_tids = key_df.groupby('val')['tid'].apply(list)
             initial_violating_pairs = set()
-            checked_pairs = set() # Avoid redundant checks
+            checked_pairs = set()
 
             for _, tids in grouped_tids.items():
                 if len(tids) > 1:
@@ -257,33 +250,25 @@ class FeatureCompiler:
                          pair_key = tuple(sorted((tid1, tid2)))
                          if pair_key in checked_pairs: continue
                          checked_pairs.add(pair_key)
-
                          tuple1_data = tuple_data_cache.get(tid1)
                          tuple2_data = tuple_data_cache.get(tid2)
                          if not tuple1_data or not tuple2_data: continue
-
-                         # Need to convert tuple_data_cache values (which might include NULL_REPR)
-                         # back to None for _check_violation if it expects None.
-                         # Assuming _check_violation handles string placeholder for now.
                          if self.detector_helper._check_violation(tuple1_data, tuple2_data, constraint):
                              initial_violating_pairs.add(pair_key)
 
             logging.debug(f"[Compiler-RelaxDC] Found {len(initial_violating_pairs)} initially violating pairs for constraint {constraint_id_str}.")
-
 
             for tid1, tid2 in initial_violating_pairs:
                 tuple1_orig_data = tuple_data_cache.get(tid1)
                 tuple2_orig_data = tuple_data_cache.get(tid2)
                 if not tuple1_orig_data or not tuple2_orig_data: continue
 
-                # Determine which cells are involved in this specific constraint
+                # Determine involved cells
                 involved_cells_t1 = set((tid1, p['a1']) for p in constraint['predicates'] if p['a1'] in tuple1_orig_data)
                 involved_cells_t2 = set((tid2, p['a2']) for p in constraint['predicates'] if p['a2'] in tuple2_orig_data)
-                # Also include potential key attributes if not already listed
                 for p in eq_preds:
                     if p['a1'] in tuple1_orig_data: involved_cells_t1.add((tid1, p['a1']))
                     if p['a2'] in tuple2_orig_data: involved_cells_t2.add((tid2, p['a2']))
-
                 all_involved_cells = involved_cells_t1.union(involved_cells_t2)
 
                 for cell_tid, cell_attr in all_involved_cells:
@@ -292,35 +277,32 @@ class FeatureCompiler:
                     original_val_tuple = tuple1_orig_data if cell_tid == tid1 else tuple2_orig_data
 
                     for candidate_val_str in candidate_vals:
-                        # Create a temporary tuple state with the candidate value
                         temp_tuple_data = original_val_tuple.copy()
-                        # Important: Convert back to actual Python None if needed by _check_violation
-                        # Assuming _check_violation can handle the string placeholder for now
-                        temp_tuple_data[cell_attr] = candidate_val_str # Keep as string
+                        temp_tuple_data[cell_attr] = candidate_val_str # Assuming _check_violation handles placeholder
 
-                        # Check if *this specific candidate* still causes violation between the original pair
                         violation_persists = False
                         if cell_tid == tid1:
                              violation_persists = self.detector_helper._check_violation(temp_tuple_data, tuple2_orig_data, constraint)
-                        else: # cell_tid == tid2
+                        else:
                              violation_persists = self.detector_helper._check_violation(tuple1_orig_data, temp_tuple_data, constraint)
 
                         if violation_persists:
-                             # --- Use unique feature name ---
-                             # Create a distinct feature name for this specific violation scenario
-                             # (Constraint ID + Cell + Candidate Value causing continued violation)
-                             # Sanitize candidate_val_str if needed for feature name validity
-                             feature_name = f"RelaxDCViolates:{constraint_id_str}:Cell={cell_tid},{cell_attr}:Cand={candidate_val_str}"
-                             # --- END Use unique feature name ---
-                             dc_features_list.append((cell_tid, cell_attr, candidate_val_str, feature_name))
+                             # --- Use HASHED feature name ---
+                             # Feature indicates violation of constraint k if this candidate is chosen for this cell
+                             # We hash the constraint ID itself to reduce dimensionality, accepting collisions.
+                             # More granular would be hashing constraint+cell+candidate, but might be too many.
+                             feature_name = f"DCViolates:{constraint_id_str}" # Base name before hashing
+                             feature_hash_id = self._hash_feature(feature_name)
+                             # --- END Use HASHED feature name ---
+                             dc_features_list.append((cell_tid, cell_attr, candidate_val_str, feature_hash_id))
 
             processed_constraints += 1
 
         logging.info(f"[Compiler-RelaxDC] Finished checking {processed_constraints} constraints.")
         duration = time.time() - start_time
-        logging.info(f"Generated {len(dc_features_list)} raw named relaxed DC feature instances in {duration:.2f}s (before deduplication).")
+        logging.info(f"Generated {len(dc_features_list)} raw hashed relaxed DC feature instances in {duration:.2f}s (before deduplication).")
         inserted = self._insert_features(dc_features_list)
-        logging.info(f"[Compiler] Inserted approx {inserted} unique named relaxed DC features.")
+        logging.info(f"[Compiler] Inserted approx {inserted} unique hashed relaxed DC features.")
         return inserted
 
 
@@ -333,30 +315,26 @@ class FeatureCompiler:
         compile_start_time = time.time()
         try:
             cooc_feat_count = self.generate_cooccurrence_features()
-            min_feat_count = self.generate_minimality_features() # Still unique name
+            min_feat_count = self.generate_minimality_features()
             dc_feat_count = 0
             if self.relax_constraints:
-                 # Note: This uses the simplified "relaxed" logic.
-                 # Implementing full violation checks against all tuples is more complex.
                  dc_feat_count = self.generate_relaxed_dc_features()
             else:
                  logging.warning("[Compiler] Hard constraint factor generation not implemented in this version.")
 
-            # Get final count from DB for a more accurate picture
+            # Get final count from DB
             final_feature_count = 0
             try:
                  with self.db_conn.cursor() as cur:
-                     # Count distinct text features in the table
                      cur.execute("SELECT COUNT(DISTINCT feature) FROM features;")
                      final_feature_count = cur.fetchone()[0]
                  logging.info(f"[Compiler] Final total unique features in table: {final_feature_count}")
             except Exception as e:
                  logging.error(f"Could not query final feature count: {e}")
-                 # Use sum of estimates as fallback, though less accurate now
                  total_features_est = cooc_feat_count + min_feat_count + dc_feat_count
                  logging.info(f"[Compiler] Estimated total unique features inserted across steps: {total_features_est}")
             else:
-                 total_features_est = final_feature_count # Use actual count
+                 total_features_est = final_feature_count
 
         except Exception as e:
              logging.error(f"[Compiler] Error during feature generation: {e}", exc_info=True)
@@ -370,16 +348,13 @@ if __name__ == '__main__':
     import config
     import sys
 
-    # Setup logging
     logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 
-    # Example: Read relax_constraints from config or default to True
     relax = getattr(config, 'RELAX_CONSTRAINTS', True)
     constraints_file = getattr(config, 'CONSTRAINTS_FILE', 'hospital_constraints.txt')
 
-    logging.info(f"Running Feature Compiler (compile.py) with Relax Constraints = {relax}")
+    logging.info(f"Running Feature Compiler (compile.py) with HASHING (Size={FEATURE_HASH_SIZE}), Relax Constraints = {relax}")
 
-    # --- Database Connection ---
     try:
         db_conn = psycopg2.connect(**config.DB_SETTINGS)
         logging.info("Database connection successful.")
@@ -387,15 +362,12 @@ if __name__ == '__main__':
         logging.error(f"Database connection failed: {e}")
         sys.exit(1)
 
-    # --- Run Compiler ---
     try:
-        # Pass constraints file path
         compiler = FeatureCompiler(db_conn, relax_constraints=relax, constraints_filepath=constraints_file)
         compiler.compile_all()
     except Exception as e:
         logging.error(f"An unexpected error occurred during compilation: {e}", exc_info=True)
     finally:
-        # --- Close Connection ---
         if db_conn:
             db_conn.close()
             logging.info("Database connection closed.")

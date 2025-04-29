@@ -15,7 +15,11 @@ import config # Assuming config.py holds DB settings
 from model.learning.tensor_builder import TensorBuilder
 from model.learning.pytorch_model import RepairModel # Your model class
 
-logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+logging.basicConfig(
+    level=logging.DEBUG, 
+    format='[%(asctime)s] %(levelname)s: %(message)s', 
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
 
 def run_pipeline(db_conn, args):
     """Runs the training and/or inference pipeline based on mode."""

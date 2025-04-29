@@ -58,7 +58,7 @@ This project aims to re-implement the HoloClean data cleaning system.
 ```
 python -m venv .venv
 source .venv/bin/activate
-
+pip install -r requirements.txt
 ```
 
 ## Order to run commands

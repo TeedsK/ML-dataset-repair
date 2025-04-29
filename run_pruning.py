@@ -32,7 +32,7 @@ def main():
         print("Connection successful.")
 
         # --- Instantiate and Run Pruner ---
-        pruner = DomainPruner(conn, tau=args.tau)
+        pruner = DomainPruner(conn)
         pruner.run()
 
         print("\n--- Domain Pruning Phase Complete ---")

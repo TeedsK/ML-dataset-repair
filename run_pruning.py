@@ -8,6 +8,14 @@ import argparse
 from config import DB_SETTINGS
 from compiler.pruning import DomainPruner
 
+import logging, sys
+
+logging.basicConfig(
+    level=logging.DEBUG,                              # show INFO, WARNING, ERROR
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]     # stream to the terminal
+)
+
 def main():
     parser = argparse.ArgumentParser(description="Run HoloClean Domain Pruning (Algorithm 2)")
     parser.add_argument(

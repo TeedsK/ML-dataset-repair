@@ -8,6 +8,14 @@ from config import DB_SETTINGS
 from compiler.compile import FeatureCompiler
 import psycopg2.extras # Make sure extras is imported if using execute_batch
 
+import logging, sys
+
+logging.basicConfig(
+    level=logging.DEBUG,                              # show INFO, WARNING, ERROR
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]     # stream to the terminal
+)
+
 def main():
     parser = argparse.ArgumentParser(description="Run HoloClean Feature Compiler")
     parser.add_argument(

@@ -8,7 +8,7 @@ DB_SETTINGS = {
     "host": "localhost",            # Connect to the host machine's mapped port
     "port": "5432"                  # The host port mapped in docker-compose.yml
 }
-
+NULL_REPR_PLACEHOLDER="__NULL__"
 # Add a check or print statement for debugging
 print("DB Settings Loaded:")
 print(f"  Database: {DB_SETTINGS['database']}")

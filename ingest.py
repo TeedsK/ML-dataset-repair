@@ -117,7 +117,7 @@ def ingest_data(csv_filepath, db_conn, row_limit=None): # Add row_limit paramete
         sys.exit(1) # Exit on error
 
 
-def main(csv_path='hospital.csv', limit=None): # Add limit parameter
+def main(csv_path='hospital_100.csv', limit=None): # Add limit parameter
     """Main function to connect to DB and run ingestion."""
     conn = None
     try:
@@ -125,6 +125,7 @@ def main(csv_path='hospital.csv', limit=None): # Add limit parameter
         conn = psycopg2.connect(**DB_SETTINGS)
         print("Database connection successful.")
         # Pass the limit to ingest_data
+        print("Using CSV: ", csv_path)
         ingest_data(csv_path, conn, row_limit=limit)
     except psycopg2.Error as db_err:
         print(f"Database error: {db_err}", file=sys.stderr)
@@ -140,7 +141,7 @@ def main(csv_path='hospital.csv', limit=None): # Add limit parameter
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Ingest hospital data into HoloClean DB.")
-    parser.add_argument('--file', type=str, default='hospital.csv', help='Path to the input CSV file.')
+    parser.add_argument('--file', type=str, default='hospital_100.csv', help='Path to the input CSV file.')
     parser.add_argument('--limit', type=int, default=None, help='Limit processing to the first N rows.')
     args = parser.parse_args()
 

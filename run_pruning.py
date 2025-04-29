@@ -33,7 +33,7 @@ def main():
 
         # --- Instantiate and Run Pruner ---
         pruner = DomainPruner(conn, tau=args.tau)
-        pruner.prune_domains()
+        pruner.run()
 
         print("\n--- Domain Pruning Phase Complete ---")
 

@@ -1,6 +1,3 @@
-# File: run_detectors.py
-# Orchestrates the execution of error detection modules.
-
 import logging
 import psycopg2
 from config import DB_SETTINGS

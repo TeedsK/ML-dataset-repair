@@ -1,57 +1,52 @@
-# File: run_compiler.py
-# Orchestrates the execution of the feature compilation step.
-
 import psycopg2
 import sys
 import argparse
 from config import DB_SETTINGS
 from compiler.compile import FeatureCompiler
-import psycopg2.extras # Make sure extras is imported if using execute_batch
+import psycopg2.extras
 
 import logging, sys
 
-logging.basicConfig(
-    level=logging.DEBUG,                              # show INFO, WARNING, ERROR
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]     # stream to the terminal
-)
+#UNCOMMENT THIS IF YOU WANT TO RECEIVE LOGS LIKE DEBUGS OR INFO
+# logging.basicConfig(
+#     level=logging.DEBUG,
+#     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+#     handlers=[logging.StreamHandler(sys.stdout)]
+# )
 
 def main():
     parser = argparse.ArgumentParser(description="Run HoloClean Feature Compiler")
     parser.add_argument(
         '--relax-constraints',
-        action='store_true', # Flag defaults to False if not present
+        action='store_true',
         help='Use relaxed denial constraints (generate features) instead of hard factors.'
     )
     parser.add_argument(
         '--no-relax-constraints',
         action='store_false',
-        dest='relax_constraints', # Explicitly set to false
+        dest='relax_constraints',
         help='Use hard denial constraints (requires factor table implementation).'
     )
-    # Set default behavior for the flag
     parser.set_defaults(relax_constraints=True)
-
     args = parser.parse_args()
 
     conn = None
     try:
-        print(f"Connecting to database for feature compilation (Relax Constraints = {args.relax_constraints})...")
+        print(f"connecting to database for feature compilation...")
         conn = psycopg2.connect(**DB_SETTINGS)
-        psycopg2.extras.register_uuid() # Needed for execute_batch
-        print("Connection successful.")
+        psycopg2.extras.register_uuid()
+        print("connected!")
 
-        # --- Instantiate and Run Compiler ---
         compiler = FeatureCompiler(conn, relax_constraints=args.relax_constraints)
         compiler.compile_all()
 
-        print("\n--- Feature Compilation Phase Complete ---")
+        print("\nFeature Compilation Phase Complete")
 
     except psycopg2.Error as db_err:
-        print(f"Database error during compilation: {db_err}", file=sys.stderr)
+        print(f"error: {db_err}", file=sys.stderr)
         sys.exit(1)
     except Exception as e:
-        print(f"An error occurred during compilation: {e}", file=sys.stderr)
+        print(f"error: {e}", file=sys.stderr)
         sys.exit(1)
     finally:
         if conn:

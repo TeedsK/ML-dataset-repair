@@ -1,19 +1,34 @@
 # File: compiler/compile.py
-# Compiles signals into features using UNIQUE FEATURE NAMES (removed hashing).
+# VERSION 6: Refines DC features (includes attribute) and adds frequency features.
 
+import numpy as np
 import pandas as pd
 import time
 import psycopg2
 import psycopg2.extras
-from collections import defaultdict
+from collections import defaultdict, Counter
 import itertools
 import logging
-# import hashlib # No longer needed for primary feature hashing
+import gc # Garbage collector
+import math
+
+from tqdm import tqdm # For log frequency
 
 from detectors.constraints import ConstraintViolationDetector
 
 NULL_REPR_PLACEHOLDER = "__NULL__"
-# FEATURE_HASH_SIZE = 5000 # No longer used for feature names
+
+# Define bins for log frequency features (adjust as needed)
+# Bins represent ranges of log10(frequency+1)
+FREQ_BINS = [0, 1, 2, 3, 4, 5] # Corresponds to freq ranges ~0, 1-9, 10-99, 100-999, etc.
+
+# --- Add Cells to Log Detailed DC Info ---
+# Keep the set for debugging specific examples if needed
+DETAILED_LOG_CELLS = {
+    (75, 'PhoneNumber'), (9, 'ZipCode'), (5, 'MeasureCode'), # False Positives
+    (72, 'ZipCode'), (16, 'City'), (99, 'MeasureName'), (61, 'MeasureName') # False Negatives
+}
+# --- End Cells to Log ---
 
 
 class FeatureCompiler:
@@ -21,11 +36,16 @@ class FeatureCompiler:
 
     def __init__(self, db_conn, relax_constraints=True, constraints_filepath="hospital_constraints.txt"):
         self.db_conn = db_conn
-        self.relax_constraints = relax_constraints # Keep flag, but logic might need more work
         self.constraints_filepath = constraints_filepath
         self.constraints = []
         self.detector_helper = None
-        # Ensure detector_helper is initialized to access _check_violation if needed
+        self.tuple_data_cache = None
+        self.cell_domains = None
+        self.dc_indexes = {}
+        # --- Added cache for global frequencies ---
+        self.global_value_counts = defaultdict(Counter)
+        # --- End Added cache ---
+
         try:
             self.detector_helper = ConstraintViolationDetector(db_conn, constraints_filepath)
             self.constraints = self.detector_helper.constraints
@@ -35,7 +55,6 @@ class FeatureCompiler:
             self.constraints = []
 
     def _clear_features(self):
-        # (Keep this method as is)
         logging.info("[Compiler] Clearing existing features...")
         try:
             with self.db_conn.cursor() as cur:
@@ -48,89 +67,126 @@ class FeatureCompiler:
             logging.error(f"[Compiler] Error clearing features table: {e}", exc_info=True)
             return False
 
-    # No longer needed: _hash_feature
+    def _load_data_and_stats(self):
+        """Loads tuple data, domains, and calculates global value counts."""
+        # Use existing cache if available
+        if self.tuple_data_cache is not None and self.cell_domains is not None and self.global_value_counts:
+             logging.info("[Compiler-Data] Using cached tuple data, domains, and stats.")
+             return True
+
+        logging.info("[Compiler-Data] Fetching data and calculating stats...")
+        load_start = time.time()
+        self.tuple_data_cache = defaultdict(dict)
+        self.cell_domains = defaultdict(set)
+        self.global_value_counts = defaultdict(Counter) # Reset counts
+
+        try:
+            # Fetch tuple data and calculate global counts simultaneously
+            with self.db_conn.cursor(name='cell_data_cursor_v5') as cur:
+                cur.itersize = 50000
+                cur.execute("SELECT tid, attr, val FROM cells")
+                for tid, attr, val in cur:
+                     val_str = NULL_REPR_PLACEHOLDER if pd.isna(val) else str(val)
+                     self.tuple_data_cache[int(tid)][attr] = val_str
+                     # Count non-null values for frequency features
+                     if val_str != NULL_REPR_PLACEHOLDER:
+                          self.global_value_counts[attr][val_str] += 1
+            logging.info(f"[Compiler-Data] Built initial value cache for {len(self.tuple_data_cache)} tuples.")
+            logging.info(f"[Compiler-Data] Calculated global value counts for {len(self.global_value_counts)} attributes.")
+
+            # Fetch domains
+            with self.db_conn.cursor(name='domain_data_cursor_v5') as cur:
+                cur.itersize = 50000
+                cur.execute("SELECT tid, attr, candidate_val FROM domains")
+                for tid, attr, candidate_val in cur:
+                     cand_str = str(candidate_val)
+                     if cand_str != NULL_REPR_PLACEHOLDER:
+                         self.cell_domains[(int(tid), attr)].add(cand_str)
+            logging.info(f"[Compiler-Data] Fetched domains for {len(self.cell_domains)} cells.")
+            load_end = time.time()
+            logging.info(f"[Compiler-Data] Data loading and stats calculation took {load_end - load_start:.2f}s.")
+            return True
+
+        except Exception as e:
+            logging.error(f"Error fetching data/calculating stats: {e}", exc_info=True)
+            self.tuple_data_cache = None
+            self.cell_domains = None
+            self.global_value_counts = defaultdict(Counter)
+            return False
+
+    def _build_dc_indexes(self):
+        # (Implementation remains the same as V4)
+        if not self.tuple_data_cache: return
+        if self.dc_indexes: return
+        logging.info("[Compiler-DC] Building helper indexes from cached data...")
+        build_start = time.time()
+        self.dc_indexes['by_zip'] = defaultdict(list)
+        self.dc_indexes['by_phone'] = defaultdict(list)
+        self.dc_indexes['by_measurecode'] = defaultdict(list)
+        self.dc_indexes['by_provider_measure'] = defaultdict(list)
+        self.dc_indexes['by_state_measure'] = defaultdict(list)
+        for tid, data in self.tuple_data_cache.items():
+            zip_val = data.get('ZipCode')
+            if zip_val and zip_val != NULL_REPR_PLACEHOLDER: self.dc_indexes['by_zip'][zip_val].append(tid)
+            phone_val = data.get('PhoneNumber')
+            if phone_val and phone_val != NULL_REPR_PLACEHOLDER: self.dc_indexes['by_phone'][phone_val].append(tid)
+            measure_val = data.get('MeasureCode')
+            if measure_val and measure_val != NULL_REPR_PLACEHOLDER: self.dc_indexes['by_measurecode'][measure_val].append(tid)
+            prov_val = data.get('ProviderNumber')
+            state_val = data.get('State')
+            if prov_val and prov_val != NULL_REPR_PLACEHOLDER and measure_val and measure_val != NULL_REPR_PLACEHOLDER:
+                 self.dc_indexes['by_provider_measure'][(prov_val, measure_val)].append(tid)
+            if state_val and state_val != NULL_REPR_PLACEHOLDER and measure_val and measure_val != NULL_REPR_PLACEHOLDER:
+                 self.dc_indexes['by_state_measure'][(state_val, measure_val)].append(tid)
+        build_end = time.time()
+        logging.info(f"[Compiler-DC] Finished building indexes in {build_end - build_start:.2f}s.")
+        for name, index in self.dc_indexes.items(): logging.debug(f"  Index '{name}' size: {len(index)} keys")
 
     def _insert_features(self, features_list):
-        """
-        Inserts features. Expects list of tuples:
-        (tid, attr, candidate_val, feature_name_string)
-        """
+        # (Implementation remains the same)
         if not features_list:
             logging.warning("[Compiler] No features generated to insert.")
             return 0
-
-        # Deduplicate features before insertion
         unique_features_set = set(features_list)
         unique_features_list = list(unique_features_set)
-
         inserted_count = 0
-        # --- MODIFIED SQL: Store unique feature name string ---
-        sql_insert = """
-            INSERT INTO features (tid, attr, candidate_val, feature)
-            VALUES (%s, %s, %s, %s)
-            ON CONFLICT (tid, attr, candidate_val, feature) DO NOTHING;
-        """
-        # --- END MODIFIED SQL ---
+        sql_insert = """INSERT INTO features (tid, attr, candidate_val, feature) VALUES (%s, %s, %s, %s) ON CONFLICT (tid, attr, candidate_val, feature) DO NOTHING;"""
         logging.info(f"[Compiler] Attempting to insert {len(unique_features_list)} unique named features...")
         insert_start_time = time.time()
         try:
             with self.db_conn.cursor() as cur:
-                 # Data should already be (tid, attr, cand_val, feature_name_str)
-                 psycopg2.extras.execute_batch(cur, sql_insert, unique_features_list, page_size=10000) # Increased page size
-                 inserted_count = len(unique_features_list) # This is approximate due to ON CONFLICT
+                 psycopg2.extras.execute_batch(cur, sql_insert, unique_features_list, page_size=10000)
+                 inserted_count = len(unique_features_list)
             self.db_conn.commit()
             insert_time = time.time() - insert_start_time
-            logging.info(f"[Compiler] Named feature insertion complete in {insert_time:.2f} seconds ({inserted_count} unique features targeted).")
-            # We can't easily get exact inserted count with ON CONFLICT, but this is the target count
+            logging.info(f"[Compiler] Feature insertion complete in {insert_time:.2f} seconds ({inserted_count} unique features targeted).")
             return inserted_count
         except Exception as e:
             self.db_conn.rollback()
             logging.error(f"[Compiler] Error inserting named features: {e}", exc_info=True)
             return 0
 
-
     def generate_cooccurrence_features(self):
-        """
-        Generates named co-occurrence features.
-        Feature Name: cooc_{attr}={candidate_val}_{other_attr}={other_val}
-        """
+        # (Implementation remains the same)
         logging.info("[Compiler] Generating NAMED co-occurrence features...")
         start_time = time.time()
         sql = f"""
-            SELECT
-                d.tid,
-                d.attr,
-                d.candidate_val,
-                c.attr AS other_attr,
-                c.val AS other_val
-            FROM domains d
-            JOIN cells c ON d.tid = c.tid AND d.attr <> c.attr
-            WHERE c.val IS NOT NULL;
+            SELECT d.tid, d.attr, d.candidate_val, c.attr AS other_attr, c.val AS other_val
+            FROM domains d JOIN cells c ON d.tid = c.tid AND d.attr <> c.attr
+            WHERE c.val IS NOT NULL AND d.candidate_val <> '{NULL_REPR_PLACEHOLDER}';
         """
         features_list = []
         try:
-            # Use a server-side cursor for potentially large results
-            with self.db_conn.cursor(name='named_cooc_feature_cursor') as cur:
-                 cur.itersize = 50000 # Adjust buffer size
+            with self.db_conn.cursor(name='named_cooc_feature_cursor_v5') as cur:
+                 cur.itersize = 50000
                  cur.execute(sql)
                  processed_rows = 0
                  for row in cur:
-                     tid, attr, candidate_val_str, other_attr, other_val_str = row[0], row[1], str(row[2]), row[3], str(row[4])
-                     # --- Use unique feature name ---
-                     # Sanitize values for feature names if they contain special characters? For now, assume simple strings.
-                     # Consider length limits if names become too long.
+                     tid, attr, candidate_val_str, other_attr, other_val_str = int(row[0]), row[1], str(row[2]), row[3], str(row[4])
                      feature_name = f'cooc_{attr}={candidate_val_str}_{other_attr}={other_val_str}'
-                     # --- END Use unique feature name ---
                      features_list.append((tid, attr, candidate_val_str, feature_name))
                      processed_rows += 1
-                     # Optional: Insert in batches within the loop if memory becomes an issue
-                     # if len(features_list) >= BATCH_SIZE:
-                     #     self._insert_features(features_list)
-                     #     features_list = []
-
-            # Insert any remaining features
             inserted = self._insert_features(features_list)
-
             duration = time.time() - start_time
             logging.info(f"[Compiler] Generated {len(features_list)} named co-occurrence feature instances from {processed_rows} DB rows in {duration:.2f}s.")
             logging.info(f"[Compiler] Inserted approx {inserted} unique named co-occurrence features.")
@@ -139,224 +195,231 @@ class FeatureCompiler:
             logging.error(f"Error generating named co-occurrence features: {e}", exc_info=True)
             return 0
 
-
     def generate_minimality_features(self):
-        """Generates the minimality prior feature (unique name)."""
-        # This feature typically has a single, non-hashed name.
+        # (Implementation remains the same)
         logging.info("[Compiler] Generating minimality prior features...")
         start_time = time.time()
-        prior_feature_name = 'prior_minimality' # Keep original unique name
+        prior_feature_name = 'prior_minimality'
         sql = f"""
-            SELECT
-                d.tid,
-                d.attr,
-                d.candidate_val
-            FROM domains d
-            JOIN cells c ON d.tid = c.tid AND d.attr = c.attr
-            WHERE
-                -- Check if candidate matches original value (handling NULLs)
-                (c.val IS NULL AND d.candidate_val = '{NULL_REPR_PLACEHOLDER}')
-                OR
-                (c.val IS NOT NULL AND d.candidate_val = CAST(c.val AS TEXT)); -- Ensure comparison as text
+            SELECT d.tid, d.attr, d.candidate_val
+            FROM domains d JOIN cells c ON d.tid = c.tid AND d.attr = c.attr
+            WHERE (c.val IS NULL AND d.candidate_val = '{NULL_REPR_PLACEHOLDER}')
+               OR (c.val IS NOT NULL AND d.candidate_val = CAST(c.val AS TEXT));
         """
         features_list = []
         try:
-            with self.db_conn.cursor(name='minimality_feature_cursor') as cur:
+            with self.db_conn.cursor(name='minimality_feature_cursor_v5') as cur:
                  cur.execute(sql)
                  processed_rows = 0
                  for row in cur:
-                      # Store the original feature name
-                      features_list.append((row[0], row[1], str(row[2]), prior_feature_name))
+                      features_list.append((int(row[0]), row[1], str(row[2]), prior_feature_name))
                       processed_rows += 1
-
-            # Insert using the general insert method now
             inserted = self._insert_features(features_list)
-
             duration = time.time() - start_time
             logging.info(f"[Compiler] Generated {len(features_list)} minimality feature instances from {processed_rows} DB rows in {duration:.2f}s.")
-            logging.info(f"[Compiler] Inserted approx {inserted} minimality features (should be 1 unique name).")
+            logging.info(f"[Compiler] Inserted approx {inserted} minimality features.")
             return inserted
         except Exception as e:
             logging.error(f"Error generating minimality features: {e}", exc_info=True)
             return 0
 
-
-    def generate_relaxed_dc_features(self):
+    # --- ADDED: generate_frequency_features ---
+    def generate_frequency_features(self):
         """
-        Generates NAMED features based on potential DC violations (using original relaxed logic).
-        Feature Name: RelaxDCViolates:{constraint_id}:Cell={tid},{attr}:Cand={candidate_val}
+        Generates features based on the global frequency of candidate values.
+        Uses logarithmic bins for stability.
+        Feature Name: LOGFREQ_{attr}_BIN={bin_index}
         """
-        if not self.relax_constraints:
-            logging.info("[Compiler] Skipping relaxed DC features (relax_constraints=False).")
-            return 0
-        if not self.constraints or self.detector_helper is None:
-             logging.warning("[Compiler] No constraints loaded/parsed or detector helper missing. Cannot generate relaxed DC features.")
+        if not self.cell_domains or not self.global_value_counts:
+             logging.error("Cannot generate frequency features: domains or global counts not available.")
              return 0
 
-        logging.info("[Compiler] Generating NAMED relaxed denial constraint features...")
-        total_dc_features_generated = 0
+        logging.info("[Compiler] Generating Log-Frequency features...")
         start_time = time.time()
+        freq_features_list = []
 
-        logging.info("[Compiler-RelaxDC] Fetching initial cell values...")
-        tuple_data_cache = defaultdict(dict)
-        try:
-            # Fetch data including NULLs
-            with self.db_conn.cursor(name='cell_data_cursor_dc') as cur:
-                cur.itersize = 50000
-                cur.execute("SELECT tid, attr, val FROM cells")
-                for tid, attr, val in cur:
-                     # Use placeholder for NULLs in the cache
-                     tuple_data_cache[int(tid)][attr] = NULL_REPR_PLACEHOLDER if pd.isna(val) else val
-            logging.info(f"[Compiler-RelaxDC] Built initial value cache for {len(tuple_data_cache)} tuples.")
-        except Exception as e:
-            logging.error(f"Error fetching initial cell data for DC checks: {e}", exc_info=True)
-            return 0
+        for (tid, attr), candidates in tqdm(self.cell_domains.items(), desc="Generating Freq Features"):
+             if not candidates: continue
+             attr_counts = self.global_value_counts.get(attr)
+             if not attr_counts: continue # Skip if no counts for this attribute
 
-        logging.info("[Compiler-RelaxDC] Fetching candidate domains...")
-        cell_domains = defaultdict(set)
-        try:
-            with self.db_conn.cursor(name='domain_data_cursor_dc') as cur:
-                cur.itersize = 50000
-                cur.execute("SELECT tid, attr, candidate_val FROM domains")
-                for tid, attr, candidate_val in cur:
-                     cell_domains[(int(tid), attr)].add(str(candidate_val))
-            logging.info(f"[Compiler-RelaxDC] Fetched domains for {len(cell_domains)} cells.")
-        except Exception as e:
-            logging.error(f"Error fetching domains for DC checks: {e}", exc_info=True)
-            return 0
+             for cand_val_str in candidates:
+                 count = attr_counts.get(cand_val_str, 0)
+                 # Calculate log10(count + 1) to handle count=0
+                 log_freq = math.log10(count + 1)
+                 # Assign to a bin
+                 bin_index = np.digitize(log_freq, FREQ_BINS, right=False) - 1 # 0-based index
+                 bin_index = max(0, bin_index) # Ensure bin index is not negative
 
-        dc_features_list = []
-        processed_constraints = 0
+                 feature_name = f"LOGFREQ_{attr}_BIN={bin_index}"
+                 freq_features_list.append((tid, attr, cand_val_str, feature_name))
 
-        for constraint in self.constraints:
-            constraint_id_str = str(constraint['id']) # Use for feature name
-            logging.debug(f"[Compiler-RelaxDC] Processing Constraint {constraint_id_str}")
-
-            # Find pairs initially violating the constraint (reusing detector logic)
-            # Note: This part can be slow if not optimized. Consider pre-calculating violations.
-            # Let's reuse the pair finding logic from your original code for now.
-            eq_preds = [p for p in constraint['predicates'] if p['type'] == 'EQ']
-            if not eq_preds: continue
-            key_attr1 = eq_preds[0]['a1']
-            sql_fetch_keys = f"SELECT tid, val FROM cells WHERE attr = %s AND val IS NOT NULL;"
-            try:
-                 # Use pandas read_sql directly, ensure correct type handling
-                 key_df = pd.read_sql(sql_fetch_keys, self.db_conn, params=(key_attr1,))
-                 key_df['tid'] = key_df['tid'].astype(int) # Ensure tid is int
-            except Exception as e:
-                 logging.warning(f"Error fetching keys for constraint {constraint_id_str}, skipping: {e}")
-                 continue
-
-            grouped_tids = key_df.groupby('val')['tid'].apply(list)
-            initial_violating_pairs = set()
-            checked_pairs = set() # Avoid redundant checks
-
-            for _, tids in grouped_tids.items():
-                if len(tids) > 1:
-                    for tid1, tid2 in itertools.combinations(tids, 2):
-                         pair_key = tuple(sorted((tid1, tid2)))
-                         if pair_key in checked_pairs: continue
-                         checked_pairs.add(pair_key)
-
-                         tuple1_data = tuple_data_cache.get(tid1)
-                         tuple2_data = tuple_data_cache.get(tid2)
-                         if not tuple1_data or not tuple2_data: continue
-
-                         # Need to convert tuple_data_cache values (which might include NULL_REPR)
-                         # back to None for _check_violation if it expects None.
-                         # Assuming _check_violation handles string placeholder for now.
-                         if self.detector_helper._check_violation(tuple1_data, tuple2_data, constraint):
-                             initial_violating_pairs.add(pair_key)
-
-            logging.debug(f"[Compiler-RelaxDC] Found {len(initial_violating_pairs)} initially violating pairs for constraint {constraint_id_str}.")
-
-
-            for tid1, tid2 in initial_violating_pairs:
-                tuple1_orig_data = tuple_data_cache.get(tid1)
-                tuple2_orig_data = tuple_data_cache.get(tid2)
-                if not tuple1_orig_data or not tuple2_orig_data: continue
-
-                # Determine which cells are involved in this specific constraint
-                involved_cells_t1 = set((tid1, p['a1']) for p in constraint['predicates'] if p['a1'] in tuple1_orig_data)
-                involved_cells_t2 = set((tid2, p['a2']) for p in constraint['predicates'] if p['a2'] in tuple2_orig_data)
-                # Also include potential key attributes if not already listed
-                for p in eq_preds:
-                    if p['a1'] in tuple1_orig_data: involved_cells_t1.add((tid1, p['a1']))
-                    if p['a2'] in tuple2_orig_data: involved_cells_t2.add((tid2, p['a2']))
-
-                all_involved_cells = involved_cells_t1.union(involved_cells_t2)
-
-                for cell_tid, cell_attr in all_involved_cells:
-                    if (cell_tid, cell_attr) not in cell_domains: continue
-                    candidate_vals = cell_domains[(cell_tid, cell_attr)]
-                    original_val_tuple = tuple1_orig_data if cell_tid == tid1 else tuple2_orig_data
-
-                    for candidate_val_str in candidate_vals:
-                        # Create a temporary tuple state with the candidate value
-                        temp_tuple_data = original_val_tuple.copy()
-                        # Important: Convert back to actual Python None if needed by _check_violation
-                        # Assuming _check_violation can handle the string placeholder for now
-                        temp_tuple_data[cell_attr] = candidate_val_str # Keep as string
-
-                        # Check if *this specific candidate* still causes violation between the original pair
-                        violation_persists = False
-                        if cell_tid == tid1:
-                             violation_persists = self.detector_helper._check_violation(temp_tuple_data, tuple2_orig_data, constraint)
-                        else: # cell_tid == tid2
-                             violation_persists = self.detector_helper._check_violation(tuple1_orig_data, temp_tuple_data, constraint)
-
-                        if violation_persists:
-                             # --- Use unique feature name ---
-                             # Create a distinct feature name for this specific violation scenario
-                             # (Constraint ID + Cell + Candidate Value causing continued violation)
-                             # Sanitize candidate_val_str if needed for feature name validity
-                             feature_name = f"RelaxDCViolates:{constraint_id_str}:Cell={cell_tid},{cell_attr}:Cand={candidate_val_str}"
-                             # --- END Use unique feature name ---
-                             dc_features_list.append((cell_tid, cell_attr, candidate_val_str, feature_name))
-
-            processed_constraints += 1
-
-        logging.info(f"[Compiler-RelaxDC] Finished checking {processed_constraints} constraints.")
         duration = time.time() - start_time
-        logging.info(f"Generated {len(dc_features_list)} raw named relaxed DC feature instances in {duration:.2f}s (before deduplication).")
-        inserted = self._insert_features(dc_features_list)
-        logging.info(f"[Compiler] Inserted approx {inserted} unique named relaxed DC features.")
+        logging.info(f"Generated {len(freq_features_list)} raw log-frequency feature instances in {duration:.2f}s.")
+        inserted = self._insert_features(freq_features_list)
+        logging.info(f"[Compiler] Inserted approx {inserted} unique log-frequency features.")
         return inserted
+    # --- END ADDED ---
+
+
+    # --- MODIFIED: generate_dc_violation_features ---
+    def generate_dc_violation_features(self):
+        """
+        Generates NAMED features indicating if assigning a candidate value
+        violates a specific denial constraint with ANY other tuple.
+        Feature Name: DC_VIOLATES_{constraint_id}_ON_{attr}
+        """
+        if not self.constraints or self.detector_helper is None: return 0
+        if not self._load_data_and_stats(): return 0 # Load data/stats needed
+        self._build_dc_indexes()
+
+        logging.info("[Compiler] Generating NAMED DC violation features (ATTR specific)...")
+        start_time = time.time()
+        dc_features_list = []
+        total_checks = 0
+        total_violations_found = 0
+        skipped_constraints = 0
+        logged_details_count = 0
+
+        for (tid, attr), candidates in tqdm(self.cell_domains.items(), desc="Checking DC Violations"):
+            if not candidates: continue
+            original_tuple_data = self.tuple_data_cache.get(tid)
+            if not original_tuple_data: continue
+
+            log_this_cell_detail = (tid, attr) in DETAILED_LOG_CELLS
+            if log_this_cell_detail: logging.info(f"[DC Detail Log] Cell ({tid}, {attr}): Candidates = {candidates}")
+
+            for cand_val_str in candidates:
+                 hypothetical_tuple = original_tuple_data.copy()
+                 hypothetical_tuple[attr] = cand_val_str
+
+                 if log_this_cell_detail: logging.info(f"  [DC Detail Log] Checking Candidate: '{cand_val_str}'")
+
+                 for constraint in self.constraints:
+                     constraint_id_str = str(constraint['id'])
+                     attrs_in_constraint = set(p['a1'] for p in constraint['predicates']).union(set(p['a2'] for p in constraint['predicates']))
+                     if attr not in attrs_in_constraint: continue
+
+                     potential_partners = []
+                     partner_found_method = False
+
+                     # Find potential partners using indexes (logic from V4)
+                     # (Keep the same partner finding logic)
+                     if constraint_id_str in ['1', '2'] and 'ZipCode' in attrs_in_constraint:
+                          key_val = hypothetical_tuple.get('ZipCode')
+                          if key_val and key_val != NULL_REPR_PLACEHOLDER:
+                              potential_partners = [t2_id for t2_id in self.dc_indexes['by_zip'].get(key_val, []) if t2_id != tid]
+                              partner_found_method = True
+                     elif constraint_id_str in ['3', '4', '5'] and 'PhoneNumber' in attrs_in_constraint:
+                          key_val = hypothetical_tuple.get('PhoneNumber')
+                          if key_val and key_val != NULL_REPR_PLACEHOLDER:
+                              potential_partners = [t2_id for t2_id in self.dc_indexes['by_phone'].get(key_val, []) if t2_id != tid]
+                              partner_found_method = True
+                     elif constraint_id_str == '6' and {'ProviderNumber', 'MeasureCode'}.issubset(attrs_in_constraint):
+                          prov = hypothetical_tuple.get('ProviderNumber')
+                          meas = hypothetical_tuple.get('MeasureCode')
+                          if prov and prov != NULL_REPR_PLACEHOLDER and meas and meas != NULL_REPR_PLACEHOLDER:
+                               potential_partners = [t2_id for t2_id in self.dc_indexes['by_provider_measure'].get((prov, meas), []) if t2_id != tid]
+                               partner_found_method = True
+                     elif constraint_id_str in ['7', '8'] and 'MeasureCode' in attrs_in_constraint:
+                          key_val = hypothetical_tuple.get('MeasureCode')
+                          if key_val and key_val != NULL_REPR_PLACEHOLDER:
+                               potential_partners = [t2_id for t2_id in self.dc_indexes['by_measurecode'].get(key_val, []) if t2_id != tid]
+                               partner_found_method = True
+                     elif constraint_id_str == '9' and {'State', 'MeasureCode'}.issubset(attrs_in_constraint):
+                          state = hypothetical_tuple.get('State')
+                          meas = hypothetical_tuple.get('MeasureCode')
+                          if state and state != NULL_REPR_PLACEHOLDER and meas and meas != NULL_REPR_PLACEHOLDER:
+                               potential_partners = [t2_id for t2_id in self.dc_indexes['by_state_measure'].get((state, meas), []) if t2_id != tid]
+                               partner_found_method = True
+
+                     if not partner_found_method:
+                          if constraint_id_str not in getattr(self, '_logged_missing_dc_logic', set()):
+                              logging.warning(f"[Compiler-DC] No specific partner finding logic for constraint {constraint_id_str}.")
+                              if not hasattr(self, '_logged_missing_dc_logic'): self._logged_missing_dc_logic = set()
+                              self._logged_missing_dc_logic.add(constraint_id_str)
+                          skipped_constraints += 1
+                          continue
+
+                     if not potential_partners: continue
+
+                     violation_found = False
+                     violating_partner = None
+                     for tid2 in potential_partners:
+                         tuple2_data = self.tuple_data_cache.get(tid2)
+                         if not tuple2_data: continue
+                         total_checks += 1
+                         try:
+                             if self.detector_helper._check_violation(hypothetical_tuple, tuple2_data, constraint):
+                                 violation_found = True
+                                 violating_partner = tid2
+                                 break
+                         except Exception as check_err:
+                              logging.error(f"Error checking violation between tid={tid} (cand='{cand_val_str}') and tid={tid2} for constraint {constraint_id_str}: {check_err}", exc_info=True)
+
+                     if violation_found:
+                          # --- Refined Feature Name ---
+                          feature_name = f"DC_VIOLATES_{constraint_id_str}_ON_{attr}"
+                          # --- End Refined Feature Name ---
+                          dc_features_list.append((tid, attr, cand_val_str, feature_name))
+                          total_violations_found += 1
+                          if log_this_cell_detail:
+                              logging.info(f"    [DC Detail Log] Candidate '{cand_val_str}' VIOLATES Constraint {constraint_id_str} (Partner TID: {violating_partner}). Added feature: {feature_name}")
+                              logged_details_count += 1
+                          # break # Optional optimization
+
+                 if log_this_cell_detail and not any(f[0]==tid and f[1]==attr and f[2]==cand_val_str and f[3].startswith("DC_VIOLATES_") for f in dc_features_list[-total_violations_found:]):
+                     logging.info(f"    [DC Detail Log] Candidate '{cand_val_str}' did NOT violate any checked constraints.")
+
+        duration = time.time() - start_time
+        logging.info(f"Checked {total_checks} potential constraint violations.")
+        if skipped_constraints > 0: logging.warning(f"Skipped DC checks for {skipped_constraints} constraint-candidate pairs...")
+        logging.info(f"Generated {len(dc_features_list)} raw DC violation feature instances in {duration:.2f}s.")
+        if logged_details_count > 0: logging.info(f"Logged details for {logged_details_count} DC violation checks.")
+        inserted = self._insert_features(dc_features_list)
+        logging.info(f"[Compiler] Inserted approx {inserted} unique DC violation features.")
+        return inserted
+    # --- END MODIFIED ---
 
 
     def compile_all(self):
         """Runs all feature generation steps."""
-        if not self._clear_features():
-            logging.error("Aborting compilation due to error clearing features.")
-            return
+        if not self._clear_features(): return
+        # --- Load data needed for multiple steps ---
+        if not self._load_data_and_stats():
+             logging.error("Aborting compilation due to error loading data/stats.")
+             return
+        # --- End Load data ---
+
         total_features_est = 0
         compile_start_time = time.time()
         try:
             cooc_feat_count = self.generate_cooccurrence_features()
-            min_feat_count = self.generate_minimality_features() # Still unique name
-            dc_feat_count = 0
-            if self.relax_constraints:
-                 # Note: This uses the simplified "relaxed" logic.
-                 # Implementing full violation checks against all tuples is more complex.
-                 dc_feat_count = self.generate_relaxed_dc_features()
-            else:
-                 logging.warning("[Compiler] Hard constraint factor generation not implemented in this version.")
+            min_feat_count = self.generate_minimality_features()
+            # --- Add Frequency Features ---
+            freq_feat_count = self.generate_frequency_features()
+            # --- End Add ---
+            dc_feat_count = self.generate_dc_violation_features() # Uses cached data
 
-            # Get final count from DB for a more accurate picture
+            logging.info("Clearing compiler caches...")
+            self.tuple_data_cache = None
+            self.cell_domains = None
+            self.dc_indexes = {}
+            self.global_value_counts = defaultdict(Counter) # Clear counts too
+            gc.collect()
+
             final_feature_count = 0
             try:
                  with self.db_conn.cursor() as cur:
-                     # Count distinct text features in the table
                      cur.execute("SELECT COUNT(DISTINCT feature) FROM features;")
                      final_feature_count = cur.fetchone()[0]
                  logging.info(f"[Compiler] Final total unique features in table: {final_feature_count}")
             except Exception as e:
                  logging.error(f"Could not query final feature count: {e}")
-                 # Use sum of estimates as fallback, though less accurate now
-                 total_features_est = cooc_feat_count + min_feat_count + dc_feat_count
+                 total_features_est = cooc_feat_count + min_feat_count + freq_feat_count + dc_feat_count
                  logging.info(f"[Compiler] Estimated total unique features inserted across steps: {total_features_est}")
             else:
-                 total_features_est = final_feature_count # Use actual count
+                 total_features_est = final_feature_count
 
         except Exception as e:
              logging.error(f"[Compiler] Error during feature generation: {e}", exc_info=True)
@@ -370,16 +433,12 @@ if __name__ == '__main__':
     import config
     import sys
 
-    # Setup logging
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+    log_level = logging.INFO # Change to logging.DEBUG for DC details
+    logging.basicConfig(level=log_level, format='[%(asctime)s] {%(levelname)s} %(name)s: %(message)s')
 
-    # Example: Read relax_constraints from config or default to True
-    relax = getattr(config, 'RELAX_CONSTRAINTS', True)
     constraints_file = getattr(config, 'CONSTRAINTS_FILE', 'hospital_constraints.txt')
+    logging.info(f"Running Feature Compiler (compile.py - Refined DC + Freq Features)")
 
-    logging.info(f"Running Feature Compiler (compile.py) with Relax Constraints = {relax}")
-
-    # --- Database Connection ---
     try:
         db_conn = psycopg2.connect(**config.DB_SETTINGS)
         logging.info("Database connection successful.")
@@ -387,15 +446,12 @@ if __name__ == '__main__':
         logging.error(f"Database connection failed: {e}")
         sys.exit(1)
 
-    # --- Run Compiler ---
     try:
-        # Pass constraints file path
-        compiler = FeatureCompiler(db_conn, relax_constraints=relax, constraints_filepath=constraints_file)
+        compiler = FeatureCompiler(db_conn, constraints_filepath=constraints_file)
         compiler.compile_all()
     except Exception as e:
         logging.error(f"An unexpected error occurred during compilation: {e}", exc_info=True)
     finally:
-        # --- Close Connection ---
         if db_conn:
             db_conn.close()
             logging.info("Database connection closed.")

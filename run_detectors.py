@@ -1,12 +1,19 @@
 # File: run_detectors.py
 # Orchestrates the execution of error detection modules.
 
+import logging
 import psycopg2
 from config import DB_SETTINGS
 from detectors.constraints import ConstraintViolationDetector
 from detectors.duplicates import DuplicateDetector
 from detectors.outliers import StatisticalOutlierDetector
 import sys
+
+logging.basicConfig(
+    level=logging.DEBUG, 
+    format='[%(asctime)s] %(levelname)s: %(message)s', 
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
 
 def run_all_detectors():
     """Connects to the DB and runs all configured detectors."""
@@ -35,7 +42,7 @@ def run_all_detectors():
 
         # --- Run Detectors ---
         print("\n--- Running Constraint Violation Detector ---")
-        constraint_detector.detect_errors()
+        constraint_detector.run()
 
         # print("\n--- Running Duplicate Detector ---")
         # duplicate_detector.detect_errors() # Uncomment when implemented

@@ -5,20 +5,20 @@
 !.vscode/extensions.json
 !.vscode/*.code-snippets
 
-# local History for Visual Studio Code
+#local History for VSC
 .history/
 
-# VSC Extensions
+#VSC Extensions
 *.vsix
 
-# do not add virtual environment
+#virtual environment
 venv/
-
 .venv
 
 __pycache__
 .DS_Store
 
-# notebook outputs
+#notebook outputs
 *.crc
 _SUCCESS
+holoclean-key.pem

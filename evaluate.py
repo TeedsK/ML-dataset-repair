@@ -1,7 +1,3 @@
-# File: evaluate.py
-# Evaluates the repair predictions against ground truth.
-# VERSION 3: Added detailed logging for FP/FN analysis.
-
 import pandas as pd
 import pickle
 import psycopg2
@@ -15,18 +11,13 @@ try:
     NULL_REPR_PLACEHOLDER = config.NULL_REPR_PLACEHOLDER
 except ImportError:
     logging.error("config.py not found or NULL_REPR_PLACEHOLDER not defined.")
-    NULL_REPR_PLACEHOLDER = "__NULL__" # Fallback
+    NULL_REPR_PLACEHOLDER = "__NULL__"
 
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 
-# (load_ground_truth, load_predictions, get_original_data functions remain the same as Version 2)
-# ... [Paste the load_ground_truth, load_predictions, get_original_data functions from the previous response here] ...
+
+# loads the ground truth from the CSV file
 def load_ground_truth(filepath="hospital_100_clean.csv"):
-    """
-    Loads the ground truth from the specified 'long' format CSV.
-    CSV format expected: tid,attribute,correct_val
-    Assumes tid in CSV is 0-based, while DB tid is 1-based.
-    """
     logging.info(f"Loading ground truth from: {filepath}")
     try:
         df_clean = pd.read_csv(filepath, names=['tid_csv', 'attribute', 'correct_val'], header=0, keep_default_na=False, dtype={'tid_csv': int, 'attribute': str, 'correct_val': str})
@@ -52,8 +43,8 @@ def load_ground_truth(filepath="hospital_100_clean.csv"):
         logging.error(f"Error loading ground truth: {e}", exc_info=True)
         return None
 
+#loads the predictions from the marginals file
 def load_predictions(filepath="inference_marginals.pkl"):
-    """Loads the predicted marginals from the pickle file."""
     logging.info(f"Loading predictions from: {filepath}")
     try:
         with open(filepath, 'rb') as f:
@@ -77,8 +68,8 @@ def load_predictions(filepath="inference_marginals.pkl"):
         logging.error(f"Error loading predictions: {e}", exc_info=True)
         return None
 
+#fetches original values and noisy status from the database
 def get_original_data(db_conn):
-    """Fetches original values and noisy status from the database."""
     logging.info("Fetching original data and noisy status from database...")
     originals = {}
     try:
@@ -95,9 +86,8 @@ def get_original_data(db_conn):
         logging.error(f"Error fetching original data: {e}", exc_info=True)
         return None
 
-
+#calculates precision, recall, f1-Score
 def evaluate_repairs(predictions, ground_truth, originals):
-    """Calculates Precision, Recall, F1-Score with detailed logging."""
     if predictions is None or ground_truth is None or originals is None:
         logging.error("Cannot evaluate due to missing data.")
         return None
@@ -105,9 +95,9 @@ def evaluate_repairs(predictions, ground_truth, originals):
     true_positives = 0
     false_positives = 0
     false_negatives = 0
-    fp_examples = [] # Store examples of false positives
-    fn_examples = [] # Store examples of false negatives
-    tp_examples = [] # Store examples of true positives
+    fp_examples = []
+    fn_examples = []
+    tp_examples = []
 
     actual_errors = set()
     for cell, data in originals.items():
@@ -122,7 +112,7 @@ def evaluate_repairs(predictions, ground_truth, originals):
 
     predictions_made_count = 0
     correctly_predicted_errors = set()
-    incorrect_predictions = set() # Track incorrect predictions specifically
+    incorrect_predictions = set()
 
     for cell in noisy_cells:
         predicted_val = predictions.get(cell)
@@ -130,9 +120,7 @@ def evaluate_repairs(predictions, ground_truth, originals):
         original_val = originals[cell]["original"] if cell in originals else None
 
         if predicted_val is None or true_val is None or original_val is None:
-            # Cannot evaluate this cell fully if any info is missing
             if cell in actual_errors:
-                # If it was an error and we didn't predict, it's an FN
                 if predicted_val is None:
                      fn_examples.append({
                          "cell": cell, "original": original_val, "truth": true_val,
@@ -143,7 +131,7 @@ def evaluate_repairs(predictions, ground_truth, originals):
         predictions_made_count += 1
 
         is_correct_prediction = (predicted_val == true_val)
-        is_actual_error = (cell in actual_errors) # Original value was wrong
+        is_actual_error = (cell in actual_errors)
 
         if is_correct_prediction and is_actual_error:
             true_positives += 1
@@ -157,29 +145,22 @@ def evaluate_repairs(predictions, ground_truth, originals):
             fp_examples.append({
                 "cell": cell, "original": original_val, "truth": true_val, "predicted": predicted_val
             })
-            # Don't double-count FN here, handled below based on actual_errors_in_noisy_set
-
-    # Calculate FN: Actual errors within the noisy set that were not correctly predicted
+            
     actual_errors_in_noisy_set = actual_errors.intersection(noisy_cells)
     missed_or_wrongly_repaired_errors = actual_errors_in_noisy_set - correctly_predicted_errors
     false_negatives = len(missed_or_wrongly_repaired_errors)
-
-    # Populate fn_examples for errors that were incorrectly predicted (already in fp_examples)
-    # and add errors that were noisy but had no prediction at all.
     for cell in missed_or_wrongly_repaired_errors:
          original_val = originals[cell]["original"]
          true_val = ground_truth[cell]
          predicted_val = predictions.get(cell)
          if predicted_val is None:
-              # Add only if not already added above
               if not any(fn['cell'] == cell for fn in fn_examples):
                    fn_examples.append({
                        "cell": cell, "original": original_val, "truth": true_val,
                        "predicted": "NO_PREDICTION", "reason": "Error in noisy set, but no prediction made"
                    })
          elif predicted_val != true_val:
-             # Already captured in FP, but note it as FN case too
-             if not any(fn['cell'] == cell for fn in fn_examples): # Avoid duplicates if logic overlaps
+             if not any(fn['cell'] == cell for fn in fn_examples):
                  fn_examples.append({
                        "cell": cell, "original": original_val, "truth": true_val,
                        "predicted": predicted_val, "reason": "Error in noisy set, incorrect prediction made"
@@ -192,38 +173,30 @@ def evaluate_repairs(predictions, ground_truth, originals):
     logging.info(f"  False Negatives (Actual Errors in Noisy Set Not Correctly Repaired): {false_negatives}")
     logging.info(f"  Total Actual Errors in Noisy Cells: {len(actual_errors_in_noisy_set)}")
 
-    # --- Print Examples ---
     if tp_examples:
         logging.info("\n--- Examples: True Positives (Correct Repairs) ---")
         for i, ex in enumerate(tp_examples):
             logging.info(f"  {ex['cell']}: Original='{ex['original']}', Predicted='{ex['predicted']}' (Correct)")
-            if i >= 4: break # Limit output
+            if i >= 4: break
     if fp_examples:
         logging.info("\n--- Examples: False Positives (Incorrect Repairs/Changes) ---")
         for i, ex in enumerate(fp_examples):
             logging.info(f"  {ex['cell']}: Original='{ex['original']}', Truth='{ex['truth']}', Predicted='{ex['predicted']}' (Incorrect)")
-            if i >= 9: break # Limit output
+            if i >= 9: break
     if fn_examples:
         logging.info("\n--- Examples: False Negatives (Missed/Incorrect Repairs of Errors) ---")
         for i, ex in enumerate(fn_examples):
              logging.info(f"  {ex['cell']}: Original='{ex['original']}', Truth='{ex['truth']}', Predicted='{ex['predicted']}' ({ex.get('reason', 'Missed')})")
-             if i >= 9: break # Limit output
+             if i >= 9: break
 
-
-    # Calculate Metrics
     precision = true_positives / (true_positives + false_positives) if (true_positives + false_positives) > 0 else 0
-    recall_overall = true_positives / actual_errors_count if actual_errors_count > 0 else 0
     recall_noisy = true_positives / len(actual_errors_in_noisy_set) if len(actual_errors_in_noisy_set) > 0 else 0
-    f1_overall = 2 * (precision * recall_overall) / (precision + recall_overall) if (precision + recall_overall) > 0 else 0
     f1_noisy = 2 * (precision * recall_noisy) / (precision + recall_noisy) if (precision + recall_noisy) > 0 else 0
 
-    print("\n--- Evaluation Results ---")
+    print("\nEvaluation Results:")
     print(f"Precision: {precision:.4f}")
-    print(f"Recall (vs all errors):    {recall_overall:.4f}")
-    print(f"F1-Score (vs all errors):  {f1_overall:.4f}")
     print(f"Recall (vs noisy errors):  {recall_noisy:.4f}")
     print(f"F1-Score (vs noisy errors):{f1_noisy:.4f}")
-    print("------------------------")
 
     return {"precision": precision, "recall_noisy": recall_noisy, "f1_score_noisy": f1_noisy}
 
@@ -234,12 +207,9 @@ if __name__ == "__main__":
     parser.add_argument('--truth_file', type=str, default='hospital_100_clean.csv', help='Path to the ground truth CSV file')
 
     args = parser.parse_args()
-
-    # Ensure config uses correct placeholder
     if 'NULL_REPR_PLACEHOLDER' not in dir(config):
          logging.error("NULL_REPR_PLACEHOLDER not found in config.py. Please define it.")
          sys.exit(1)
-
     if not os.path.exists(args.pred_file):
          logging.error(f"Prediction file not found: {args.pred_file}")
          sys.exit(1)

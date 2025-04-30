@@ -7,12 +7,12 @@ import psycopg2.extras
 
 import logging, sys
 
-#UNCOMMENT THIS IF YOU WANT TO RECEIVE LOGS LIKE DEBUGS OR INFO
-# logging.basicConfig(
-#     level=logging.DEBUG,
-#     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-#     handlers=[logging.StreamHandler(sys.stdout)]
-# )
+# COMMENT OR UNCOMMENT THIS IF YOU WANT TO RECEIVE LOGS LIKE DEBUGS OR INFO
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
 
 def main():
     parser = argparse.ArgumentParser(description="Run HoloClean Feature Compiler")

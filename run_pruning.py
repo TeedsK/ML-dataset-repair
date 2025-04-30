@@ -1,6 +1,3 @@
-# File: run_pruning.py
-# Orchestrates the execution of the domain pruning step.
-
 import psycopg2
 import psycopg2.extras
 import sys
@@ -11,9 +8,9 @@ from compiler.pruning import DomainPruner
 import logging, sys
 
 logging.basicConfig(
-    level=logging.DEBUG,                              # show INFO, WARNING, ERROR
+    level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]     # stream to the terminal
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
 
 def main():
@@ -21,7 +18,7 @@ def main():
     parser.add_argument(
         '--tau',
         type=float,
-        default=0.5, # Default threshold suggested by blueprint/paper
+        default=0.5,
         help='Conditional probability threshold (tau) for co-occurrence pruning.'
     )
     args = parser.parse_args()
@@ -34,12 +31,10 @@ def main():
     try:
         print(f"Connecting to database for domain pruning (tau={args.tau})...")
         conn = psycopg2.connect(**DB_SETTINGS)
-        # Import extras for execute_batch
-        psycopg2.extras.register_uuid() # Needed for execute_batch potentially
+        psycopg2.extras.register_uuid()
 
         print("Connection successful.")
 
-        # --- Instantiate and Run Pruner ---
         pruner = DomainPruner(conn)
         pruner.run()
 

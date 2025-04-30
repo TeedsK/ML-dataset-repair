@@ -1,7 +1,7 @@
-pandas>=1.5 # Or your preferred version
-psycopg2-binary>=2.9 # Or psycopg2 if compiling
-python-dotenv>=0.20 # For loading .env file
-scipy>=1.9 # For scipy.stats
+pandas>=1.5
+psycopg2-binary>=2.9
+python-dotenv>=0.20
+scipy>=1.9
 pgmpy 
 networkx 
 torch

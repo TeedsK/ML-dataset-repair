@@ -1,7 +1,3 @@
-# File: model/learning/tensor_builder.py
-# Builds PyTorch tensors from database data.
-# VERSION 5: Uses sparse tensors for feature data (X_train, X_pred).
-
 import pandas as pd
 import torch
 import time
@@ -12,7 +8,6 @@ from collections import defaultdict
 import pickle
 import os
 
-# Assuming config.py has NULL_REPR_PLACEHOLDER
 try:
     import config
     NULL_REPR_PLACEHOLDER = config.NULL_REPR_PLACEHOLDER
@@ -21,8 +16,8 @@ except (ImportError, AttributeError):
     NULL_REPR_PLACEHOLDER = "__NULL__"
 
 
+#builds feature tensors (sparse) for training and prediction.
 class TensorBuilder:
-    """Builds feature tensors (sparse) for training and prediction."""
 
     def __init__(self, db_conn):
         self.db_conn = db_conn
@@ -39,28 +34,23 @@ class TensorBuilder:
         self.max_domain_size = 0
         self.evidence_var_indices = []
         self.query_var_indices = []
-        self.state_features = defaultdict(list) # Stores lists of *feature indices* for each state
-
-        # Tensors - X will be sparse, Y/mask remain dense
+        self.state_features = defaultdict(list)
         self.X_train_sparse = None
         self.Y_train = None
         self.mask_train = None
         self.X_pred_sparse = None
         self.mask_pred = None
-        self.pred_indices = None # Stores original var_idx for prediction outputs
+        self.pred_indices = None
 
         self.loaded_state = False
         logging.info("[TensorBuilder] Initializing (Sparse Mode)...")
 
     def _get_state_idx(self, var_idx, domain_val_idx):
-        # This helper might be less relevant if not directly indexing dense state map,
-        # but keep for potential debugging or alternative feature storage.
         if self.max_domain_size <= 0:
              raise ValueError(f"max_domain_size must be positive before calculating state index (was {self.max_domain_size}).")
         return var_idx * self.max_domain_size + domain_val_idx
 
     def _load_metadata(self, reuse_feature_map=None, reuse_max_domain=None):
-        # --- Metadata Loading (largely unchanged, ensure feature_to_idx is built correctly) ---
         if reuse_feature_map is None:
              self.feature_to_idx = {}
              self.idx_to_feature = {}
@@ -70,16 +60,15 @@ class TensorBuilder:
         logging.info("[TensorBuilder] Loading metadata from DB (cells, domains, features)...")
         load_start = time.time()
 
-        # 1. Load/Reuse distinct features and create mapping
         logging.info("  Loading features...")
         if reuse_feature_map is not None:
             logging.info("  Reusing feature map from training phase.")
+
             self.feature_to_idx = reuse_feature_map
-            # Important: Recalculate num_features and idx_to_feature from the reused map
             self.num_features = len(self.feature_to_idx)
             self.idx_to_feature = {v: k for k, v in self.feature_to_idx.items()}
-            # Find minimality index within the reused map
             self.minimality_feature_idx = -1
+
             for name, idx in self.feature_to_idx.items():
                  if name == 'prior_minimality':
                      self.minimality_feature_idx = idx
@@ -89,16 +78,13 @@ class TensorBuilder:
             else:
                  logging.warning("  'prior_minimality' feature not found in reused feature map!")
         else:
-            # Discover features from DB
             features_df = pd.read_sql("SELECT DISTINCT feature FROM features", self.db_conn)
             feature_list = features_df['feature'].tolist()
-            # Ensure prior_minimality is included and consistently indexed if present
+
             if 'prior_minimality' not in feature_list and any(f.startswith('h_') for f in feature_list):
-                 # Add it if other features exist but it's missing (shouldn't happen if compile ran correctly)
                  logging.warning("Adding 'prior_minimality' to feature list as it was missing.")
                  feature_list.append('prior_minimality')
 
-            # Build the map
             self.feature_to_idx = {name: idx for idx, name in enumerate(feature_list)}
             self.idx_to_feature = {idx: name for idx, name in enumerate(feature_list)}
             self.num_features = len(self.feature_to_idx)
@@ -111,7 +97,7 @@ class TensorBuilder:
                  logging.warning("  'prior_minimality' feature was not found in the database features table!")
 
 
-        # 2. Load cell info (variables) - Unchanged
+        #load cell info
         logging.info("  Loading cells info...")
         cells_df = pd.read_sql("SELECT tid, attr, val, is_noisy FROM cells ORDER BY tid, attr", self.db_conn)
         self.num_vars = len(cells_df)
@@ -129,11 +115,11 @@ class TensorBuilder:
                 self.query_var_indices.append(idx)
             else:
                 self.evidence_var_indices.append(idx)
-        logging.info(f"  Processed {self.num_vars} total cells (variables).")
+        logging.info(f"  processed {self.num_vars} total cells (variables).")
         logging.info(f"  Identified {len(self.evidence_var_indices)} evidence variables and {len(self.query_var_indices)} query variables.")
 
 
-        # 3. Load domains and determine max size - Unchanged logic for finding max_domain_size
+        #load domains and determine max size
         logging.info("  Loading domains from 'domains' table...")
         domain_dfs = pd.read_sql("SELECT tid, attr, candidate_val FROM domains ORDER BY tid, attr, candidate_val",
                                 self.db_conn, chunksize=100000)
@@ -146,10 +132,11 @@ class TensorBuilder:
             for _, row in chunk.iterrows():
                 cell = (int(row['tid']), row['attr'])
                 candidate_str = str(row['candidate_val'])
-                if candidate_str == NULL_REPR_PLACEHOLDER: continue # Skip placeholder
+                if candidate_str == NULL_REPR_PLACEHOLDER: continue
                 temp_domains[cell].append(candidate_str)
                 row_count+=1
             pbar_domains.update(len(chunk))
+
         pbar_domains.close()
         logging.info(f"  Finished reading {row_count} non-null candidate entries from 'domains' table.")
         logging.info(f"  Processing domains for {len(temp_domains)} unique cells found in 'domains' table.")
@@ -157,14 +144,13 @@ class TensorBuilder:
         current_max_domain = 0
         processed_domain_count = 0
         logging.info("  Calculating max domain size and mapping domains...")
+        
         for cell, domain_list in temp_domains.items():
             if cell not in self.cell_to_var_idx: continue
             var_idx = self.cell_to_var_idx[cell]
             unique_domain_list = sorted(list(set(domain_list)))
             domain_size = len(unique_domain_list)
             if domain_size > current_max_domain:
-                # Log only significant increases to reduce noise? Or keep logging all increases.
-                # Let's keep logging all for now.
                 logging.info(f"    New max domain size found: {domain_size} (Previous: {current_max_domain}) for Cell={cell} (VarIdx={var_idx})")
                 current_max_domain = domain_size
 
@@ -183,16 +169,17 @@ class TensorBuilder:
         logging.info(f"  Final Max domain size being used: {self.max_domain_size}")
 
 
-        # 4. Load features per state - Store feature *indices* directly
+        #load features per state - store feature indices directly
         logging.info("  Loading features per state (mapping to indices)...")
-        self.state_features = defaultdict(list) # Reset, stores list of feature indices
+        self.state_features = defaultdict(list)
         if self.max_domain_size <= 0 and self.num_vars > 0:
              raise ValueError(f"max_domain_size is {self.max_domain_size}, cannot map features to states.")
 
         feature_chunks = pd.read_sql(
             "SELECT tid, attr, candidate_val, feature FROM features",
-            self.db_conn, chunksize=100000 # Larger chunksize for potentially big table
+            self.db_conn, chunksize=100000
         )
+
         pbar_features = tqdm(desc="  Mapping features", unit=" features")
         processed_features_count = 0
         unknown_feature_count = 0
@@ -204,9 +191,8 @@ class TensorBuilder:
                 if cell not in self.cell_to_var_idx: continue
                 var_idx = self.cell_to_var_idx[cell]
                 candidate_val_str = str(row['candidate_val'])
-                feature_name = row['feature'] # This is the unique string name now
+                feature_name = row['feature'] 
 
-                # Check if candidate is in the mapped domain for this variable
                 domain_val_idx = self.var_idx_to_val_to_idx[var_idx].get(candidate_val_str)
                 if domain_val_idx is None:
                      if skipped_candidate_feature_count < 10:
@@ -214,7 +200,7 @@ class TensorBuilder:
                      skipped_candidate_feature_count += 1
                      continue
 
-                # Get the index for this feature name
+                #get the index for this feature name
                 feature_idx = self.feature_to_idx.get(feature_name)
                 if feature_idx is None:
                      if unknown_feature_count < 10:
@@ -222,9 +208,7 @@ class TensorBuilder:
                      unknown_feature_count += 1
                      continue
 
-                # Store the feature INDEX associated with this state (var_idx, domain_val_idx)
-                # We no longer need the global state_idx helper
-                # Key is (var_idx, domain_val_idx), value is list of feature indices
+                #store the feature INDEX associated with this state
                 state_key = (var_idx, domain_val_idx)
                 self.state_features[state_key].append(feature_idx)
                 chunk_mapped_count += 1
@@ -232,7 +216,7 @@ class TensorBuilder:
             processed_features_count += chunk_mapped_count
         pbar_features.close()
 
-        # Deduplicate feature indices per state (important for sparse tensor construction)
+        #unduplicate feature indices per state
         logging.info("  Deduplicating feature indices per state...")
         for key in self.state_features:
             self.state_features[key] = list(set(self.state_features[key]))
@@ -247,13 +231,13 @@ class TensorBuilder:
         logging.info(f"[TensorBuilder] Metadata loaded and mappings built in {load_end - load_start:.2f}s.")
 
 
+    #builds the final tensors (Sparse X, Dense Y/Mask).
     def build_tensors(self):
-        """Builds the final tensors (Sparse X, Dense Y/Mask)."""
+
         if self.X_train_sparse is not None:
             logging.warning("Tensors already built. Skipping.")
             return
 
-        # --- Metadata Check ---
         needs_load = False
         if self.num_features == 0 or self.num_vars == 0: needs_load = True
         elif self.max_domain_size <= 0 and self.num_vars > 0: needs_load = True
@@ -265,24 +249,22 @@ class TensorBuilder:
                   self._load_metadata()
              if self.num_features == 0 or self.num_vars == 0 or (self.max_domain_size <= 0 and self.num_vars > 0):
                   raise ValueError("Metadata still empty or max_domain_size <= 0 after attempting load. Cannot build tensors.")
-        # --- End Check ---
-
+        
         logging.info("[TensorBuilder] Building PyTorch tensors (Sparse X)...")
         build_start = time.time()
         num_evidence = len(self.evidence_var_indices)
         num_query = len(self.query_var_indices)
 
-        # --- Tensor Allocation (Y/Mask are Dense, X uses lists for sparse) ---
         self.Y_train = torch.full((num_evidence,), -1, dtype=torch.long)
         self.mask_train = torch.full((num_evidence, self.max_domain_size), -1e6, dtype=torch.float32)
         self.mask_pred = torch.full((num_query, self.max_domain_size), -1e6, dtype=torch.float32)
         self.pred_indices = torch.tensor(self.query_var_indices, dtype=torch.long)
 
-        # Lists to collect sparse tensor components
-        train_indices = [] # List of [train_idx, domain_val_idx, feature_idx]
-        train_values = []  # List of 1.0 corresponding to indices
-        pred_indices_sparse = [] # List of [pred_idx, domain_val_idx, feature_idx]
-        pred_values = []   # List of 1.0 corresponding to indices
+        #lists that collect sparse tensor components
+        train_indices = []
+        train_values = []
+        pred_indices_sparse = []
+        pred_values = []
 
         logging.info(f"  Populating training tensors ({num_evidence} variables)...")
         valid_training_samples = 0
@@ -305,24 +287,25 @@ class TensorBuilder:
 
             initial_idx_in_domain = self.var_idx_to_val_to_idx[var_idx].get(initial_val_str)
 
-            # Populate Y_train and Mask
+            #populate Y_train and Mask
             if initial_idx_in_domain is not None:
                  self.Y_train[train_idx] = initial_idx_in_domain
                  valid_training_samples += 1
-                 # Unblock mask only for valid domain entries of this trainable sample
+
                  for domain_val_idx in self.var_idx_to_domain[var_idx].keys():
                      self.mask_train[train_idx, domain_val_idx] = 0.0
             else:
                  logging.debug(f"Initial value '{initial_val_str}' for evidence VarIdx {var_idx} (Cell: {cell}) not found in its domain. Masking out sample.")
                  skipped_training_samples += 1
-                 # Keep Y_train=-1 and mask_train=-1e6 for this sample
 
-            # Populate sparse X_train components (for all domain values, even if sample is masked out for Y)
+            #populate sparse X_train components 
             for domain_val_idx in self.var_idx_to_domain[var_idx].keys():
                 state_key = (var_idx, domain_val_idx)
                 feature_indices_for_state = self.state_features.get(state_key, [])
+                
                 for feature_idx in feature_indices_for_state:
-                    # Ensure feature index is valid
+                    
+                    
                     if 0 <= feature_idx < self.num_features:
                         train_indices.append([train_idx, domain_val_idx, feature_idx])
                         train_values.append(1.0)
@@ -340,28 +323,30 @@ class TensorBuilder:
                  logging.warning(f"No domain found or empty domain for query VarIdx {var_idx} (Cell: {self.var_idx_to_cell.get(var_idx)}). Predictions will be based on blocked mask.")
                  continue
 
-            # Populate sparse X_pred components and unblock mask
+            #populate sparse X_pred components and unblock mask
             for domain_val_idx in self.var_idx_to_domain[var_idx].keys():
-                 self.mask_pred[pred_idx, domain_val_idx] = 0.0 # Unblock mask
+                 self.mask_pred[pred_idx, domain_val_idx] = 0.0
                  state_key = (var_idx, domain_val_idx)
                  feature_indices_for_state = self.state_features.get(state_key, [])
+
                  for feature_idx in feature_indices_for_state:
+                     
                      if 0 <= feature_idx < self.num_features:
                          pred_indices_sparse.append([pred_idx, domain_val_idx, feature_idx])
                          pred_values.append(1.0)
                          feature_count_pred += 1
+
                      else:
                           logging.warning(f"Invalid feature index {feature_idx} encountered for query state {state_key}. Max features: {self.num_features}")
 
         logging.info(f"  Finished populating prediction tensors. Features added: {feature_count_pred}")
 
-        # --- Create Sparse Tensors ---
         logging.info("  Creating sparse tensors...")
         sparse_create_start = time.time()
 
-        # Training Tensor
+        #training Tensor
         if train_indices:
-            train_indices_tensor = torch.tensor(train_indices, dtype=torch.long).t() # Transpose for COO format
+            train_indices_tensor = torch.tensor(train_indices, dtype=torch.long).t()
             train_values_tensor = torch.tensor(train_values, dtype=torch.float32)
             train_size = (num_evidence, self.max_domain_size, self.num_features)
             self.X_train_sparse = torch.sparse_coo_tensor(train_indices_tensor, train_values_tensor, train_size)
@@ -371,7 +356,7 @@ class TensorBuilder:
             train_size = (num_evidence, self.max_domain_size, self.num_features)
             self.X_train_sparse = torch.sparse_coo_tensor(torch.empty((3, 0), dtype=torch.long), torch.empty(0), train_size)
 
-        # Prediction Tensor
+        # prediction
         if pred_indices_sparse:
             pred_indices_tensor = torch.tensor(pred_indices_sparse, dtype=torch.long).t()
             pred_values_tensor = torch.tensor(pred_values, dtype=torch.float32)
@@ -386,7 +371,6 @@ class TensorBuilder:
         sparse_create_end = time.time()
         logging.info(f"  Sparse tensor creation took {sparse_create_end - sparse_create_start:.2f}s.")
 
-        # Coalesce sparse tensors for efficiency (sums duplicate indices)
         logging.info("  Coalescing sparse tensors...")
         coalesce_start = time.time()
         if self.X_train_sparse is not None: self.X_train_sparse = self.X_train_sparse.coalesce()
@@ -398,14 +382,14 @@ class TensorBuilder:
         build_end = time.time()
         logging.info(f"[TensorBuilder] Tensors built in {build_end - build_start:.2f}s.")
 
+    #returns sparse X_train, dense Y_train, dense mask_train.
     def get_training_data(self):
-        """Returns sparse X_train, dense Y_train, dense mask_train."""
         if self.X_train_sparse is None:
             self.build_tensors()
         return self.X_train_sparse, self.Y_train, self.mask_train
 
+    #returns sparse X_pred, dense mask_pred, dense pred_indices.
     def get_prediction_data(self):
-        """Returns sparse X_pred, dense mask_pred, dense pred_indices."""
         if self.X_pred_sparse is None:
             self.build_tensors()
         return self.X_pred_sparse, self.mask_pred, self.pred_indices
@@ -429,12 +413,12 @@ class TensorBuilder:
     def get_var_idx_to_cell_map(self):
          return self.var_idx_to_cell
 
+    #saves state needed for prediction (feature map, domain size type things)
     def save_state(self, filepath="tensor_builder_state.pkl"):
-        """Saves essential state needed for prediction (feature map, domain size)."""
         if self.max_domain_size <= 0:
              logging.warning(f"Attempting to save state but max_domain_size is not positive ({self.max_domain_size}).")
 
-        # Only save state needed for prediction consistency
+        # saves state thats needed for prediction consistency
         state = {
             'feature_to_idx': self.feature_to_idx,
             'num_features': self.num_features,
@@ -448,8 +432,8 @@ class TensorBuilder:
         except Exception as e:
             logging.error(f"Error saving TensorBuilder state: {e}", exc_info=True)
 
+    #loads state before building tensors for prediction.
     def load_state(self, filepath="tensor_builder_state.pkl"):
-        """Loads state, typically before building tensors for prediction."""
         if not os.path.exists(filepath):
              logging.error(f"TensorBuilder state file not found: {filepath}")
              self.loaded_state = False
@@ -458,13 +442,12 @@ class TensorBuilder:
             with open(filepath, 'rb') as f:
                 state = pickle.load(f)
 
-            # Load essential state
             self.feature_to_idx = state.get('feature_to_idx', {})
             self.num_features = state.get('num_features', 0)
             self.max_domain_size = state.get('max_domain_size', 0)
             self.minimality_feature_idx = state.get('minimality_feature_idx', -1)
 
-            # Rebuild reverse map
+            #rebuild reverse map
             self.idx_to_feature = {v: k for k, v in self.feature_to_idx.items()}
 
             logging.info(f"[TensorBuilder] State loaded from {filepath}")

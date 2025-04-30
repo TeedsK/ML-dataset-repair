@@ -1,31 +1,18 @@
-# File: docker-compose.yml
-# Defines the PostgreSQL service for the HoloClean project.
-
-version: '3.8' # Use a recent version
+version: '3.8'
 
 services:
   postgres_db:
-    image: postgres:15 # Use PostgreSQL version 15 as specified in the blueprint
+    image: postgres:15 
     container_name: holoclean_postgres_db
     environment:
-      # These environment variables are used by the postgres image
-      # to initialize the database and create the user/password.
-      # IMPORTANT: These are shared credentials for the class project as requested.
-      # Do NOT use these in a real production environment.
       POSTGRES_DB: holoclean_db
       POSTGRES_USER: holoclean_user
-      POSTGRES_PASSWORD: holoclean_password # Changed password for clarity
+      POSTGRES_PASSWORD: holoclean_password
     ports:
-      # Map host port 5432 to container port 5432
-      # If port 5432 is already in use on your host, change the first number (e.g., "5433:5432")
-      # and update config.py accordingly.
       - "5432:5432"
     volumes:
-      # Persist database data outside the container in a Docker volume
-      # This ensures data isn't lost when the container stops/restarts.
       - postgres_data:/var/lib/postgresql/data
-    restart: always # Optional: Automatically restart the container if it stops
-
+    restart: always
+    
 volumes:
-  # Define the named volume used above
   postgres_data:

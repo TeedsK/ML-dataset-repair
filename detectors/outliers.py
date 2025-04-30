@@ -1,19 +1,16 @@
-# File: detectors/outliers.py
-# Placeholder for statistical outlier detection (e.g., Z-score, Isolation Forest).
-
 from .base_detector import BaseDetector
 import pandas as pd
 import numpy as np
 from scipy import stats
 
+#detects statistical outliers in number type attributes.
 class StatisticalOutlierDetector(BaseDetector):
-    """Detects statistical outliers in numeric attributes."""
 
     def __init__(self, db_conn, attributes=None, method='zscore', threshold=3.0):
         super().__init__(db_conn)
-        # Default numeric attributes from hospital schema - adjust as needed
+
         self.attributes = attributes if attributes else ['Score', 'Sample']
-        self.method = method # 'zscore' or potentially 'isolation_forest'
+        self.method = method
         self.threshold = threshold
 
     def detect_errors(self):
@@ -22,22 +19,24 @@ class StatisticalOutlierDetector(BaseDetector):
 
         if self.method == 'zscore':
             for attr in self.attributes:
+
                 print(f"[{self.detector_name}] Processing attribute '{attr}' with Z-score...")
                 sql = "SELECT tid, val FROM cells WHERE attr = %s;"
+
                 try:
                     df = pd.read_sql(sql, self.db_conn, params=(attr,))
-                    # Attempt to convert to numeric, coercing errors to NaN
-                    df['val_numeric'] = pd.to_numeric(df['val'], errors='coerce')
-                    df.dropna(subset=['val_numeric'], inplace=True) # Remove non-numeric rows
 
-                    if len(df) < 2: # Need at least 2 points for Z-score
+                    df['val_numeric'] = pd.to_numeric(df['val'], errors='coerce')
+                    df.dropna(subset=['val_numeric'], inplace=True)
+
+                    if len(df) < 2:
                          print(f"Not enough numeric data for Z-score on '{attr}'.")
                          continue
 
-                    # Calculate Z-scores
+                    #Z-scores
                     df['zscore'] = np.abs(stats.zscore(df['val_numeric']))
 
-                    # Identify outliers
+                    #find outliers
                     outliers = df[df['zscore'] > self.threshold]
                     noisy_cells = list(zip(outliers['tid'], [attr] * len(outliers)))
 
@@ -52,15 +51,7 @@ class StatisticalOutlierDetector(BaseDetector):
                     print(f"Error processing outliers for attribute '{attr}': {e}")
 
         elif self.method == 'isolation_forest':
-             print(f"[{self.detector_name}] Placeholder: Isolation Forest not implemented yet.")
-             # --- Placeholder Logic ---
-             # 1. Fetch data for specified numeric attributes into a DataFrame.
-             # 2. Handle missing/non-numeric values.
-             # 3. Train sklearn.ensemble.IsolationForest model.
-             # 4. Predict anomalies (-1 indicates anomaly).
-             # 5. Collect list of noisy cells: [(tid, attr), ...] for anomalous cells.
-             # 6. Call self._add_noisy_cells(list_of_noisy_cells)
-             # -------------------------
+             #implement in the future
              pass
         else:
             print(f"[{self.detector_name}] Unknown outlier detection method: {self.method}")

@@ -1,61 +1,115 @@
-# HoloClean Re-Implementation Project
+# HoloClean For CS6964
 
-This project aims to re-implement the HoloClean data cleaning system.
+This project by Theo Kremer, Adam Liu, and Luke Aldover was made in order to try and reimplement the HoloClean data cleaning system.
 
 ## Setup Instructions
 
-### Prerequisites
+*make sure you have docker installed*
 
-1.  **Docker:** Install Docker Desktop (Windows/Mac) or Docker Engine (Linux). See [Get Docker](https://docs.docker.com/get-docker/).
-2.  **Docker Compose:** Usually included with Docker Desktop. For Linux, you might need to install it separately. See [Install Docker Compose](https://docs.docker.com/compose/install/).
-3.  **Python:** Python 3.10+ installed.
-4.  **Python Dependencies:** Install required libraries:
-    ```bash
-    pip install pandas "psycopg2-binary>=2.8"
+1) Open a terminal in the project's root directory 
+
+2) Run:
+```
+docker-compose up -d
+```
+you should see a container named holoclean_postgres_db running and listening on port 5432
+
+3) to build the table definitions, we use the definitions from scehma.sql and run these commands: 
+
+    **Option 1 (we think only works on Mac)**
     ```
-5.  **Input Data:** Ensure `hospital.csv` is present in the project's root directory (or update the path in `ingest.py`).
-
-### Steps
-
-1.  **Start the Database Container:**
-    Open your terminal in the project's root directory (where `docker-compose.yml` is located) and run:
-    ```bash
-    docker-compose up -d
+    chmod +x init-db.sh
+    ./init-db.sh
     ```
-    * `-d` runs the container in detached mode (in the background).
-    * The first time you run this, Docker will download the `postgres:15` image.
-    * This command starts the PostgreSQL container, creates the database (`holoclean_db`), the user (`holoclean_user`), and sets the password (`holoclean_password`).
-    * **Check:** Run `docker ps`. You should see a container named `holoclean_postgres_db` running and listing port `5432`.
 
-2.  **Create the Database Schema:**
-    You need to apply the table definitions from `schema.sql` to the running database container.
-    * **Method A (Recommended - using script):** Make the script executable and run it:
-        ```bash
-        chmod +x init-db.sh
-        ./init-db.sh
-        ```
-    * **Method B (Manual):** If you don't use the script, run this command:
-        ```bash
-        docker cp schema.sql holoclean_postgres_db:/schema.sql
-        docker exec -e PGPASSWORD=holoclean_password holoclean_postgres_db psql -U holoclean_user -d holoclean_db -f /schema.sql
-        # Optional cleanup: docker exec holoclean_postgres_db rm /schema.sql
-        ```
-    * **Check:** The script/command should output "Database schema applied successfully." or similar. No errors should appear. You can manually verify by running `docker exec -it holoclean_postgres_db psql -U holoclean_user -d holoclean_db` and then using `\dt` inside the container's `psql` prompt (type `\q` to exit `psql`).
-
-3.  **Ingest Initial Data:**
-    Run the Python script to load `hospital.csv` into the `cells` table:
-    ```bash
-    python ingest.py
+    **Option 2**
     ```
-    * **Check:**
-        * The script should output success messages, including the number of rows inserted.
-        * Connect to the database inside the container (as shown in Step 2 Check) and run SQL queries:
-            * `SELECT COUNT(*) FROM cells;` (Verify the count matches expected: #rows * #cols)
-            * `SELECT COUNT(DISTINCT tid) FROM cells;` (Verify the count matches #rows in CSV)
-            * `SELECT * FROM cells LIMIT 5;` (Inspect sample data)
+    docker cp schema.sql holoclean_postgres_db:/schema.sql
+    docker exec -e PGPASSWORD=holoclean_password holoclean_postgres_db psql -U holoclean_user -d holoclean_db -f /schema.sql
+    ```
 
-### Stopping the Database
+It should output 'Database schema applied successfully.' and no errors should show, you can also check by running:
 
-To stop the database container when you're done:
-```bash
-docker-compose down
+```
+docker exec -it holoclean_postgres_db psql -U holoclean_user -d holoclean_db`
+```
+
+and then you can use \dt inside the container
+
+*you can use \q to exit from this view*
+
+4) Opening a virtual env (possibly optional)
+```
+python -m venv .venv
+```
+    **On Mac, Run:**
+    ```
+    source .venv/bin/activate
+    ```
+
+    **On Windows, Run:**
+    ```
+    .venv\Scripts\activate
+    ```
+
+then run:
+```
+pip install -r requirements.txt
+```
+## How to Run HoloClean 
+
+If you want to run everything at once, run:
+
+```
+python ingest.py
+python run_detectors.py    
+python run_pruning.py     
+python run_compiler.py       
+python run_inference.py --mode train_predict --learniter 25 --save_model_path trained_model_100.pth --save_builder_path builder_state_100.pkl --pred_output_file marginals_100_rows.pkl --lr 0.005
+python evaluate.py --pred_file marginals_100_rows.pkl --truth_file hospital_100_clean.csv
+```
+
+and everything will run sequentially and end with the evaluation results
+
+
+## If You Want to Run One Item at a time
+
+1) insert all the data into the database
+```
+python ingest.py
+```
+
+2) runs the error detectors
+```
+python run_detectors.py
+```
+
+3) runs the pruning and generates domains
+```
+python run_pruning.py
+```
+
+4) runs the compiler and generates the features
+```
+python run_compiler.py
+```
+
+5) runs inference, in training + predicting mode
+With these arguments, it creates 25 epochs, has a learning rate of 0.005, and saves the files in their corresponding paths
+```
+python run_inference.py \
+    --mode train_predict \
+    --learniter 25 \
+    --save_model_path trained_model_100.pth \
+    --save_builder_path builder_state_100.pkl \
+    --pred_output_file marginals_100_rows.pkl \
+    --lr 0.005
+```
+
+6) runs the evaluation
+With these arguments, it opens the same file generated in step 5 and compares it to the clean hospital data file (our truth file)
+```
+python evaluate.py \
+    --pred_file marginals_100_rows.pkl \
+    --truth_file hospital_100_clean.csv
+```

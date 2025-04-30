@@ -1,224 +1,315 @@
-# File: detectors/constraints.py
-# Detects violations of denial constraints.
-
-import re
 import pandas as pd
+import itertools
+import logging
 import time
-from .base_detector import BaseDetector
+from collections import Counter, defaultdict
+import psycopg2
+import psycopg2.extras
 
-class ConstraintViolationDetector(BaseDetector):
-    """Detects errors based on denial constraints."""
+MIN_VIOLATION_SUPPORT = 2
 
-    def __init__(self, db_conn, constraints_filepath="hospital_constraints.txt"):
-        super().__init__(db_conn)
-        self.constraints_filepath = constraints_filepath
+#detects cells involved in denial constraint violations
+class ConstraintViolationDetector:
+
+    def __init__(self, db_conn, constraints_file):
+        self.db_conn = db_conn
+        self.constraints_file = constraints_file
         self.constraints = self._parse_constraints()
+        self._tuple_data_cache = None
+        self._fd_support_cache = {}
+        self._potential_fds = set()
+
 
     def _parse_constraints(self):
-        """Parses constraints from the file."""
         constraints = []
+        
         try:
-            with open(self.constraints_filepath, 'r') as f:
+            with open(self.constraints_file, 'r') as f:
                 for i, line in enumerate(f):
                     line = line.strip()
-                    if not line or line.startswith('#'):
-                        continue
-                    parsed = self._parse_single_constraint(line, constraint_id=i + 1)
-                    if parsed:
-                        constraints.append(parsed)
-            print(f"Parsed {len(constraints)} constraints from {self.constraints_filepath}")
-            return constraints
+
+                    if not line or line.startswith('#'): continue
+                    
+                    parts = line.split('&')
+                    constraint = {'id': i + 1, 'predicates': []}
+                    
+                    for part in parts:
+                        part = part.strip()
+                        
+                        if part.startswith('EQ('):
+                            attrs = part[3:-1].split(',')
+                            constraint['predicates'].append({'type': 'EQ', 't1': attrs[0].split('.')[0], 'a1': attrs[0].split('.')[1], 't2': attrs[1].split('.')[0], 'a2': attrs[1].split('.')[1]})
+                        
+                        elif part.startswith('IQ('):
+                             attrs = part[3:-1].split(',')
+                             constraint['predicates'].append({'type': 'IQ', 't1': attrs[0].split('.')[0], 'a1': attrs[0].split('.')[1], 't2': attrs[1].split('.')[0], 'a2': attrs[1].split('.')[1]})
+                    constraints.append(constraint)
+
+            logging.info(f"Parsed {len(constraints)} constraints from {self.constraints_file}")
+        
         except FileNotFoundError:
-            print(f"Error: Constraint file not found at {self.constraints_filepath}")
-            return []
+            logging.error(f"Constraints file not found: {self.constraints_file}")
+        
         except Exception as e:
-            print(f"Error parsing constraints file: {e}")
-            return []
+            logging.error(f"Error parsing constraints file: {e}", exc_info=True)
+        
+        return constraints
 
-    def _parse_single_constraint(self, line, constraint_id):
-        """Parses a single constraint line into a structured dictionary."""
-        # Example parsing logic - needs to be robust for different predicate types
-        # Format: t1&t2&PRED(t1.Attr1, t2.Attr2)&PRED(...)
-        predicates = []
-        # Simple regex to find EQ(tX.Attr,tY.Attr) or IQ(tX.Attr,tY.Attr)
-        pattern = re.compile(r"(EQ|IQ)\(t(\d+)\.(\w+),t(\d+)\.(\w+)\)")
-        matches = pattern.findall(line)
+    def _fetch_tuple_data(self):
+        
+        if self._tuple_data_cache is not None: return
+        
+        logging.info("[ConstraintDetector] Fetching all tuple data into memory...")
+        self._tuple_data_cache = defaultdict(dict)
+        
+        try:
+            with self.db_conn.cursor(name='constraint_data_cursor_v7') as cur:
+                cur.itersize = 50000
+                cur.execute("SELECT tid, attr, val FROM cells ORDER BY tid")
+                
+                for tid, attr, val in cur:
+                    self._tuple_data_cache[int(tid)][attr] = str(val) if not pd.isna(val) else None
+            
+            logging.info(f"Cached data for {len(self._tuple_data_cache)} tuples.")
+        
+        except Exception as e:
+            logging.error(f"Error fetching tuple data: {e}", exc_info=True)
+            self._tuple_data_cache = None
 
-        if not matches:
-            print(f"Warning: Could not parse predicates in constraint line {constraint_id}: {line}")
-            return None
+    #precomputes the support for functional dependencies
+    def _precompute_fd_support(self):
+        if not self._tuple_data_cache: return
+        if self._fd_support_cache: return
+        
+        logging.info("[ConstraintDetector] Precomputing FD support counts...")
+        
+        self._fd_support_cache = {}
+        self._potential_fds = set()
+        
+        for const in self.constraints:
+            eq_preds = [p for p in const['predicates'] if p['type'] == 'EQ']
+            iq_preds = [p for p in const['predicates'] if p['type'] == 'IQ']
+            
+            if len(eq_preds) == 1 and len(iq_preds) == 1 and \
+               eq_preds[0]['a1'] == eq_preds[0]['a2'] and iq_preds[0]['a1'] == iq_preds[0]['a2']:
+                  key_attr = eq_preds[0]['a1']; target_attr = iq_preds[0]['a1']
+                  self._potential_fds.add((key_attr, target_attr))
+        
+        logging.info(f"Identified potential FD keys/targets for support calc: {self._potential_fds}")
+        
+        for key_attr, target_attr in self._potential_fds:
+            support_key = (key_attr, target_attr)
+            self._fd_support_cache[support_key] = defaultdict(Counter)
+            
+            for tid, data in self._tuple_data_cache.items():
+                key_val = data.get(key_attr); target_val = data.get(target_attr)
+                
+                if key_val is not None and target_val is not None:
+                    self._fd_support_cache[support_key][key_val][target_val] += 1
+            
+            logging.debug(f"  Computed support for {key_attr} -> {target_attr}. Index size: {len(self._fd_support_cache[support_key])} keys.")
+        
+        logging.info("[ConstraintDetector] FD support precomputation finished.")
 
-        involved_attrs = set()
-        for pred_type, t1_idx, a1, t2_idx, a2 in matches:
-            if t1_idx != '1' or t2_idx != '2':
-                 print(f"Warning: Constraint {constraint_id} currently only supports t1 and t2. Found t{t1_idx}, t{t2_idx}.")
-                 # For simplicity, we only handle t1, t2 constraints here. Extend if needed.
-                 # return None # Or adapt logic
-            predicates.append({
-                'type': pred_type, # 'EQ' or 'IQ'
-                'a1': a1,
-                'a2': a2
-            })
-            involved_attrs.add(a1)
-            involved_attrs.add(a2)
-
-        return {
-            'id': constraint_id,
-            'text': line,
-            'predicates': predicates,
-            'involved_attrs': list(involved_attrs)
-        }
-
+    #checks if the constraint is violated
     def _check_violation(self, tuple1_data, tuple2_data, constraint):
-        """Checks if two tuples (as dicts attr->val) violate a constraint."""
+        violated = True
         for pred in constraint['predicates']:
-            val1 = tuple1_data.get(pred['a1'])
-            val2 = tuple2_data.get(pred['a2'])
+            
+            val1 = tuple1_data.get(pred['a1']); val2 = tuple2_data.get(pred['a2'])
+            if val1 is None or val2 is None: violated = False; break
+            
+            pred_result = False
+            
+            try:
+                
+                if pred['type'] == 'EQ': pred_result = (str(val1) == str(val2))
+                elif pred['type'] == 'IQ': pred_result = (str(val1) != str(val2))
+                else: 
+                    logging.warning(f"Unsupported predicate type {pred['type']}...")
+                    violated = False
+                    break
 
-            # Handle comparison with potential None values carefully
-            is_eq = (val1 is not None) and (val2 is not None) and (str(val1) == str(val2))
-            # IQ often implies case-insensitivity in data cleaning contexts
-            is_iq = (val1 is not None) and (val2 is not None) and (str(val1).lower() != str(val2).lower())
+                if not pred_result: 
+                    violated = False
+                    break
 
-            if pred['type'] == 'EQ':
-                if not is_eq: return False # If EQ is required but not met, constraint is satisfied
-            elif pred['type'] == 'IQ':
-                if not is_iq: return False # If IQ is required but not met, constraint is satisfied
-            else:
-                 # Handle other predicate types if needed (>, <, etc.)
-                 print(f"Warning: Unsupported predicate type {pred['type']}")
-                 return False # Assume satisfied if predicate unknown
+            except Exception as e: 
+                logging.error(f"Error evaluating predicate {pred}..."); violated = False
+                break
+        
+        return violated
 
-        # If we went through all predicates and none failed, the conjunction is TRUE, so the DC is violated.
-        return True
+    #checks if the violation has sufficient support
+    def _has_sufficient_support(self, key_attr, target_attr, key_val, conflicting_target_val):
+        support_key = (key_attr, target_attr)
+        
+        if key_val is None or conflicting_target_val is None: return False
+        if support_key not in self._fd_support_cache: return False
+        
+        support_counts = self._fd_support_cache[support_key].get(key_val, Counter())
+        conflicting_support = support_counts.get(conflicting_target_val, 0)
+        
+        return conflicting_support >= MIN_VIOLATION_SUPPORT
+    
+    #finds violations of the constraints
+    def find_violations(self):
+        
+        if not self.constraints: return [], set()
+        self._fetch_tuple_data()
+        
+        if self._tuple_data_cache is None: return [], set()
+        self._precompute_fd_support()
+        
+        violations_db = []
+        noisy_cells = set()
+        
+        start_time = time.time(); processed_constraints = 0
+        total_potential_violations = 0; total_ignored_low_support = 0
+        
+        logging.info(f"Checking {len(self.constraints)} constraints with MIN_VIOLATION_SUPPORT={MIN_VIOLATION_SUPPORT}...")
+        
+        for constraint in self.constraints:
+            constraint_id = constraint['id']
+            
+            logging.debug(f"[ConstraintDetector] Checking constraint {constraint_id}: {constraint['predicates']}")
+            const_start_time = time.time(); violation_count_for_constraint = 0; ignored_count_for_constraint = 0
+            
+            is_potential_fd = False; fd_key_attr = None; fd_target_attr = None
+            
+            eq_preds = [p for p in constraint['predicates'] if p['type'] == 'EQ']
+            iq_preds = [p for p in constraint['predicates'] if p['type'] == 'IQ']
+            
+            if len(eq_preds) == 1 and len(iq_preds) == 1 and eq_preds[0]['a1'] == eq_preds[0]['a2'] and iq_preds[0]['a1'] == iq_preds[0]['a2']:
+                 fd_key_attr = eq_preds[0]['a1']; fd_target_attr = iq_preds[0]['a1']
+                 if (fd_key_attr, fd_target_attr) in self._potential_fds: is_potential_fd = True
+            
+            key_attrs = [eq_preds[0]['a1']] if len(eq_preds) > 0 else []
+            
+            if not key_attrs: 
+                logging.warning(f"Cannot determine key attributes for constraint {constraint_id}. Skipping.")
+                continue
+            
+            key_attr = key_attrs[0]; logging.debug(f"Using key attribute '{key_attr}' for constraint {constraint_id}")
+            grouped_by_key = defaultdict(list)
+            
+            for tid, data in self._tuple_data_cache.items():
+                key_val = data.get(key_attr)
+                if key_val is not None: grouped_by_key[key_val].append(tid)
+            
+            checked_pairs = set()
+            
+            for key_val, tids in grouped_by_key.items():
+                if len(tids) > 1:
+                    for tid1, tid2 in itertools.combinations(tids, 2):
+                        pair_key = tuple(sorted((tid1, tid2)));
+                        
+                        if pair_key in checked_pairs: continue
+                        
+                        checked_pairs.add(pair_key)
+                        t1_data = self._tuple_data_cache[tid1]; t2_data = self._tuple_data_cache[tid2]
+                        
+                        if self._check_violation(t1_data, t2_data, constraint):
+                            total_potential_violations += 1
+                            apply_support_check = is_potential_fd; passes_support_check = True
+                            t1_noisy_target = False; t2_noisy_target = False
+                            
+                            if apply_support_check:
+                                
+                                t1_target = t1_data.get(fd_target_attr); t2_target = t2_data.get(fd_target_attr)
+                                t1_maybe_noisy = self._has_sufficient_support(fd_key_attr, fd_target_attr, key_val, t2_target)
+                                t2_maybe_noisy = self._has_sufficient_support(fd_key_attr, fd_target_attr, key_val, t1_target)
+                                
+                                if not t1_maybe_noisy and not t2_maybe_noisy:
+                                    passes_support_check = False; total_ignored_low_support += 1; ignored_count_for_constraint += 1
+                                    logging.debug(f"FD Violation {constraint_id} between {tid1} & {tid2} ignored by support.")
+                                
+                                else:
+                                    if t1_maybe_noisy: t1_noisy_target = True
+                                    if t2_maybe_noisy: t2_noisy_target = True
 
-    def detect_errors(self):
-        """Detects constraint violations and populates tables."""
-        total_violations_found = 0
-        total_noisy_cells_added = 0
-        start_time = time.time()
+                            if passes_support_check:
 
-        # Clear previous violations for idempotency
+                                violations_db.append((constraint_id, tid1, tid2)) 
+                                violation_count_for_constraint += 1
+
+                                if apply_support_check:
+                                    if t1_noisy_target: noisy_cells.add((tid1, fd_target_attr))
+                                    if t2_noisy_target: noisy_cells.add((tid2, fd_target_attr))
+                                else:
+                                    for pred in constraint['predicates']:
+                                        if pred['a1'] in t1_data: noisy_cells.add((tid1, pred['a1']))
+                                        if pred['a2'] in t2_data: noisy_cells.add((tid2, pred['a2']))
+            
+            const_end_time = time.time()
+            logging.info(f"Constraint {constraint_id} finished in {const_end_time - const_start_time:.2f}s found {violation_count_for_constraint} violations passing support (ignored {ignored_count_for_constraint} due to low support).")
+            processed_constraints += 1
+        
+        end_time = time.time()
+        
+        logging.info(f"Finished checking all constraints in {end_time - start_time:.2f} seconds.")
+        logging.info(f"Total potential violations found (before support): {total_potential_violations}")
+        logging.info(f"Total violations ignored due to low support: {total_ignored_low_support}")
+        logging.info(f"Total violations stored in DB: {len(violations_db)}")
+        logging.info(f"Total unique cells marked as noisy (after support): {len(noisy_cells)}")
+        return violations_db, noisy_cells
+
+    #inserts violations and updates noisy cells in the database
+    def insert_violations(self, violations, noisy_cells):
+        if not violations and not noisy_cells:
+            logging.info("[ConstraintDetector] No violations or noisy cells to insert.")
+            return
+
         try:
             with self.db_conn.cursor() as cur:
-                 print(f"[{self.detector_name}] Clearing previous violations...")
-                 cur.execute("DELETE FROM violations WHERE constraint_id IN %s;", (tuple(c['id'] for c in self.constraints),))
-                 # Optionally clear noisy_cells added by this detector
-                 # cur.execute("DELETE FROM noisy_cells WHERE detection_method = %s;", (self.detector_name,))
-                 self.db_conn.commit()
-        except Exception as e:
-             print(f"[{self.detector_name}] Error clearing previous violations: {e}")
+
+                logging.info("[ConstraintDetector] Clearing previous violations...")
+                cur.execute("DELETE FROM violations;")
+                cur.execute("DELETE FROM noisy_cells;")
+                cur.execute("UPDATE cells SET is_noisy = FALSE;")
+
+                if violations:
+                    logging.info(f"Inserting {len(violations)} violation instances...")
+
+                    insert_sql_violations = "INSERT INTO violations (constraint_id, tids) VALUES (%s, %s);"
+                    violations_to_insert = [(v[0], f"{{{v[1]},{v[2]}}}") for v in violations]
+
+                    psycopg2.extras.execute_batch(cur, insert_sql_violations, violations_to_insert, page_size=5000)
+                    logging.info(f"Inserted {len(violations_to_insert)} violation instances.")
+
+                if noisy_cells:
+                    noisy_list = list(noisy_cells)
+                    logging.info(f"Inserting {len(noisy_list)} unique noisy cell entries...")
+                    insert_sql_noisy = "INSERT INTO noisy_cells (tid, attr) VALUES (%s, %s) ON CONFLICT DO NOTHING;"
+                    psycopg2.extras.execute_batch(cur, insert_sql_noisy, noisy_list, page_size=5000)
+                    logging.info("Updating is_noisy flag in cells table...")
+                    cur.execute("CREATE TEMP TABLE temp_noisy (tid INT, attr TEXT);")
+                    psycopg2.extras.execute_batch(cur, "INSERT INTO temp_noisy (tid, attr) VALUES (%s, %s);", noisy_list, page_size=5000)
+                    cur.execute("CREATE INDEX ON temp_noisy (tid, attr);")
+                    cur.execute("UPDATE cells c SET is_noisy = TRUE FROM temp_noisy t WHERE c.tid = t.tid AND c.attr = t.attr;")
+                    cur.execute("DROP TABLE temp_noisy;")
+                    logging.info(f"Updated is_noisy flag for {len(noisy_list)} cells.")
+
+            self.db_conn.commit()
+            logging.info("[ConstraintDetector] Violations and noisy cells committed to database.")
+
+        except psycopg2.errors.InvalidTextRepresentation as e:
+             logging.error(f"Database schema error during insertion: {e}")
+             logging.error("Please ensure the 'violations' table has column 'tids' of type bigint[] or int[] and the format '{tid1,tid2}' is correct.")
              self.db_conn.rollback()
-             # Decide whether to proceed or stop
-
-        for constraint in self.constraints:
-            print(f"\n[{self.detector_name}] Checking constraint {constraint['id']}: {constraint['text']}")
-            violation_count = 0
-            noisy_cells_for_constraint = set() # Use a set to avoid duplicates
-
-            # --- Strategy: Fetch relevant data, then check in Python ---
-            # 1. Identify potential violating keys based on EQ predicates
-            #    E.g., if EQ(t1.ZipCode, t2.ZipCode), fetch groups of tids sharing the same ZipCode.
-            #    This requires dynamic SQL based on constraint structure.
-            #    Simplification: Iterate through all pairs (can be slow).
-            #    Better Simplification: For each constraint, identify a 'key' attribute (e.g., the first EQ attribute).
-            #                           Fetch all cells for that attribute, group by value, then compare pairs within groups.
-
-            eq_preds = [p for p in constraint['predicates'] if p['type'] == 'EQ']
-            if not eq_preds:
-                 print(f"Warning: Constraint {constraint['id']} has no EQ predicates. Skipping pairwise check for now.")
-                 continue # Naive pairwise check is too slow without filtering
-
-            # Use the first EQ predicate's attributes as a potential key
-            key_attr1 = eq_preds[0]['a1']
-            key_attr2 = eq_preds[0]['a2'] # Assume keys match for simplicity for now
-
-            # Fetch all tuples (tid and value) for the key attribute
-            sql_fetch_keys = f"SELECT tid, val FROM cells WHERE attr = %s AND val IS NOT NULL;"
-            try:
-                key_df = pd.read_sql(sql_fetch_keys, self.db_conn, params=(key_attr1,))
-                print(f"Fetched {len(key_df)} potential key values for attr '{key_attr1}'.")
-            except Exception as e:
-                print(f"Error fetching key values for constraint {constraint['id']}: {e}")
-                continue
-
-            # Group TIDs by the key value
-            grouped_tids = key_df.groupby('val')['tid'].apply(list)
-
-            # Fetch all involved attributes for faster lookup
-            involved_attrs_str = ', '.join(f"'{a}'" for a in constraint['involved_attrs'])
-            sql_fetch_data = f"SELECT tid, attr, val FROM cells WHERE attr IN ({involved_attrs_str});"
-            try:
-                all_data_df = pd.read_sql(sql_fetch_data, self.db_conn)
-                all_data_df.set_index('tid', inplace=True) # Index by tid for faster lookup
-                print(f"Fetched data for {len(constraint['involved_attrs'])} involved attributes.")
-                 # Convert to a dictionary for faster lookups: {tid: {attr: val}}
-                tuple_data_cache = {}
-                for tid, group in all_data_df.groupby(level=0): # Group by index (tid)
-                     tuple_data_cache[tid] = group.set_index('attr')['val'].to_dict()
-                print("Created tuple data cache.")
-            except Exception as e:
-                 print(f"Error fetching tuple data for constraint {constraint['id']}: {e}")
-                 continue
+        
+        except psycopg2.errors.UndefinedColumn as e:
+             logging.error(f"Database schema error during insertion: {e}")
+             logging.error("Please ensure the 'violations' table has columns 'constraint_id', 'tids' and 'noisy_cells' has 'tid', 'attr'. Check schema.sql.")
+             self.db_conn.rollback()
+        
+        except Exception as e:
+            self.db_conn.rollback()
+            logging.error(f"Error inserting violations/noisy cells: {e}", exc_info=True)
 
 
-            # Iterate through groups where more than one TID shares the key value
-            violation_pairs_tids = set() # Store (t1, t2) where t1 < t2
-            for key_val, tids in grouped_tids.items():
-                if len(tids) > 1:
-                    # Check all pairs within this group
-                    for i in range(len(tids)):
-                        for j in range(i + 1, len(tids)):
-                            tid1 = tids[i]
-                            tid2 = tids[j]
-
-                            # Avoid re-checking pairs already found
-                            pair_key = tuple(sorted((tid1, tid2)))
-                            if pair_key in violation_pairs_tids:
-                                continue
-
-                            # Get data for t1 and t2 from cache
-                            tuple1_data = tuple_data_cache.get(tid1, {})
-                            tuple2_data = tuple_data_cache.get(tid2, {})
-
-                            if not tuple1_data or not tuple2_data:
-                                # Should not happen if data was fetched correctly
-                                continue
-
-                            # Check if this pair violates the constraint
-                            if self._check_violation(tuple1_data, tuple2_data, constraint):
-                                violation_count += 1
-                                violation_pairs_tids.add(pair_key)
-
-                                # Identify specific noisy cells based on predicates
-                                for pred in constraint['predicates']:
-                                    # Flag both cells involved in the specific predicate causing violation
-                                    # (Could refine this based on EQ/IQ logic)
-                                    if pred['a1'] in tuple1_data: noisy_cells_for_constraint.add((tid1, pred['a1']))
-                                    if pred['a2'] in tuple2_data: noisy_cells_for_constraint.add((tid2, pred['a2']))
-
-            # Insert violations into the database
-            if violation_pairs_tids:
-                sql_insert_violation = """
-                    INSERT INTO violations (constraint_id, tids) VALUES (%s, %s);
-                """
-                violations_to_insert = [(constraint['id'], list(pair)) for pair in violation_pairs_tids]
-                try:
-                    with self.db_conn.cursor() as cur:
-                        cur.executemany(sql_insert_violation, violations_to_insert)
-                    self.db_conn.commit()
-                    print(f"Inserted {len(violations_to_insert)} violation instances for constraint {constraint['id']}.")
-                    total_violations_found += len(violations_to_insert)
-                except Exception as e:
-                    self.db_conn.rollback()
-                    print(f"Error inserting violations for constraint {constraint['id']}: {e}")
-
-            # Add identified noisy cells
-            added_count = self._add_noisy_cells(list(noisy_cells_for_constraint))
-            total_noisy_cells_added += added_count
-
-        end_time = time.time()
-        print(f"\n[{self.detector_name}] Finished in {end_time - start_time:.2f} seconds.")
-        print(f"[{self.detector_name}] Total violations found: {total_violations_found}")
-        print(f"[{self.detector_name}] Total unique noisy cells added: {total_noisy_cells_added}") # May differ from sum if cells violate multiple constraints
-        return total_violations_found
+    def run(self):
+        """Runs the full detection and insertion process."""
+        violations, noisy_cells = self.find_violations()
+        self.insert_violations(violations, noisy_cells)
+        logging.info("[ConstraintDetector] Finished.")
